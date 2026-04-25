@@ -517,13 +517,37 @@ def derive_mcp_config(tool: ToolDefinition) -> Optional[dict]:
                 if pkg_name:
                     _backend = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                     electron_path = os.environ.get("OPENSWARM_ELECTRON_PATH")
-                    # Check for single-file bundle first (e.g. reddit-mcp-buddy)
-                    bundle_path = os.path.join(_backend, "mcp-bundles", f"{pkg_name}.js")
-                    if os.path.isfile(bundle_path) and electron_path:
+                    # Two bundle layouts in mcp-bundles/, checked in priority order:
+                    #
+                    #  1. Multi-file bundle dir: mcp-bundles/<safe>/dist/index.js
+                    #     Used when the SDK reads sibling files at runtime.
+                    #     Examples: @softeria/ms-365-mcp-server reads
+                    #     ../package.json for --version and dist/endpoints.json
+                    #     for Graph API definitions; @notionhq/notion-mcp-server
+                    #     reads ../scripts/notion-openapi.json. The build script
+                    #     ships a stripped package.json (no "type":"module") next
+                    #     to dist/ so __dirname/../package.json resolves correctly.
+                    #     See scripts/build-app.sh `build_mcp_bundle_dir`.
+                    #
+                    #  2. Single-file bundle: mcp-bundles/<safe>.js
+                    #     Used when the SDK is fully self-contained
+                    #     (reddit-mcp-buddy).
+                    #
+                    # Scoped names get flattened ("@softeria/ms-365-mcp-server"
+                    # -> "softeria-ms-365-mcp-server") for filesystem safety.
+                    safe_bundle = pkg_name.replace("/", "-").replace("@", "")
+                    bundle_dir_path = os.path.join(_backend, "mcp-bundles", safe_bundle, "dist", "index.js")
+                    bundle_file_path = os.path.join(_backend, "mcp-bundles", f"{safe_bundle}.js")
+                    bundle_path = None
+                    if os.path.isfile(bundle_dir_path):
+                        bundle_path = bundle_dir_path
+                    elif os.path.isfile(bundle_file_path):
+                        bundle_path = bundle_file_path
+                    if bundle_path and electron_path:
                         config["command"] = electron_path
                         config["args"] = [bundle_path]
                         config.setdefault("env", {})["ELECTRON_RUN_AS_NODE"] = "1"
-                        logger.info(f"Using bundled MCP server for {pkg_name}")
+                        logger.info(f"Using bundled MCP server for {pkg_name} ({bundle_path})")
                     else:
                         # Check for pre-installed npm package (works in both dev and packaged modes)
                         safe_dir = pkg_name.replace("/", "-").replace("@", "")

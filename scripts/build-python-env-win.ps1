@@ -81,7 +81,9 @@ Write-Host "Verifying claude-agent-sdk..."
 & $PythonBin -c "import claude_agent_sdk; print('claude-agent-sdk installed')"
 if ($LASTEXITCODE -ne 0) { throw "claude-agent-sdk verification failed" }
 
-# Cleanup
+# Cleanup. Drop test packages and any stale __pycache__/.pyc from the
+# upstream tarball — we want our own freshly-compiled bytecode (next
+# step), not whatever the upstream build happened to ship.
 Write-Host "Cleaning up..."
 Get-ChildItem -Path $PythonEnvDir -Recurse -Force -Directory `
     | Where-Object { $_.Name -in @('__pycache__','tests','test') } `
@@ -89,12 +91,42 @@ Get-ChildItem -Path $PythonEnvDir -Recurse -Force -Directory `
 Get-ChildItem -Path $PythonEnvDir -Recurse -Force -Filter '*.pyc' `
     | Remove-Item -Force -ErrorAction SilentlyContinue
 
+# Strip parts of the Python distribution we provably don't use at runtime.
+# Each removal here has been individually verified — conservative on purpose.
+# NOT removing pip/, babel/locale-data/, pygments lexers, or PIL — each had
+# at least one weak import-evidence trail.
+Write-Host "Stripping unused Python distribution files..."
+$ToStrip = @(
+    (Join-Path $PythonEnvDir 'include'),                          # C headers — never used at runtime
+    (Join-Path $PythonEnvDir 'lib\python3.13\idlelib'),           # IDLE editor — headless backend has no GUI
+    (Join-Path $PythonEnvDir 'lib\python3.13\tkinter'),           # Tk GUI toolkit — same
+    (Join-Path $PythonEnvDir 'lib\python3.13\ensurepip'),         # Pip bootstrap — backend never installs at runtime
+    (Join-Path $PythonEnvDir 'lib\python3.13\turtledemo'),        # Educational drawing examples
+    (Join-Path $PythonEnvDir 'share')                             # Man pages / desktop integration
+)
+foreach ($p in $ToStrip) {
+    if (Test-Path $p) { Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue }
+}
+
+# Pre-compile bytecode so cold backend startup skips parse+compile on
+# every imported .py. Worth ~5-10s on Windows under Defender (parsing
+# Python source is parser-bound; loading .pyc is just bytes). We cap
+# concurrency at 4 — `-j 0` (all cores) is fine on dev boxes but
+# unstable on small CI runners. Missing .pyc is non-fatal at runtime
+# (Python falls back to in-memory compile), so we warn rather than fail.
+Write-Host "Pre-compiling bytecode..."
+& $PythonBin -m compileall -q -j 4 (Join-Path $PythonEnvDir 'lib')
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: some files failed to compile; runtime will fall back to in-memory compile." -ForegroundColor Yellow
+}
+
 $Size = (Get-ChildItem -Path $PythonEnvDir -Recurse -File `
     | Measure-Object -Property Length -Sum).Sum
 $SizeMB = [math]::Round($Size / 1MB, 1)
+$PycCount = (Get-ChildItem -Path $PythonEnvDir -Recurse -File -Filter '*.pyc' | Measure-Object).Count
 
 Write-Host ""
 Write-Host "=== Python Environment Ready ==="
 Write-Host "Location: $PythonEnvDir"
-Write-Host ("Size: {0} MB" -f $SizeMB)
+Write-Host ("Size: {0} MB ({1} .pyc files)" -f $SizeMB, $PycCount)
 Write-Host ""

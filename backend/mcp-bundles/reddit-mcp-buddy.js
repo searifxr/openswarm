@@ -1,3 +1,4 @@
+const __OPENSWARM_IMPORT_META_URL__ = require("url").pathToFileURL(__filename).href;
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;

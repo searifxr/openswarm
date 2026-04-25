@@ -83,53 +83,136 @@ if (-not (Test-Path (Join-Path $UvBinDir 'uvx.exe'))) {
 }
 Write-Host ""
 
-# --- Step 0b: Bundle reddit-mcp-buddy via esbuild ---
+# --- Step 0b: Bundle npm MCP servers via esbuild ---
+# Each bundle compiles down to a single ~5-15 MB CommonJS file under
+# backend\mcp-bundles\, runs on Electron's bundled Node at runtime
+# (ELECTRON_RUN_AS_NODE=1), and is preferred by tools_lib.py:521 over
+# any pre-installed node_modules tree. Bundling instead of shipping
+# node_modules cuts the installer file count from ~28k -> ~9k, which
+# is the dominant lever on NSIS install time + Defender scan cost.
 $McpBundleDir = Join-Path $ProjectRoot 'backend\mcp-bundles'
 New-Item -ItemType Directory -Force -Path $McpBundleDir | Out-Null
-$RedditBundle = Join-Path $McpBundleDir 'reddit-mcp-buddy.js'
-if (-not (Test-Path $RedditBundle)) {
-    Write-Host "[0b] Bundling reddit-mcp-buddy..."
+
+# Single-file CJS bundle. Output path: mcp-bundles\<output>.js. Use for
+# packages that don't read sibling files at runtime. The import.meta.url
+# polyfill is applied uniformly because nearly every modern ESM package
+# uses createRequire(import.meta.url) somewhere — without the polyfill,
+# esbuild's ESM->CJS transform leaves import.meta.url as undefined and
+# the bundle crashes at module load.
+function Build-McpBundleSingle($PackageName, $EntrySubpath, $OutputName) {
+    $OutFile = Join-Path $McpBundleDir $OutputName
+    if ((Test-Path $OutFile) -and -not $env:OPENSWARM_REBUILD_BUNDLES) {
+        Write-Host "[0b] $PackageName bundle already present (set `$env:OPENSWARM_REBUILD_BUNDLES='1' to force rebuild)."
+        return
+    }
+    Write-Host "[0b] Bundling $PackageName -> $OutputName ..."
     $TmpDir = Join-Path $env:TEMP "openswarm-mcp-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
     Push-Location $TmpDir
     try {
-        & npm install reddit-mcp-buddy --silent 2>$null
-        & npx esbuild "node_modules/reddit-mcp-buddy/dist/index.js" --bundle --platform=node --format=cjs "--outfile=$RedditBundle"
-        if ($LASTEXITCODE -ne 0) { throw "esbuild failed" }
-        Write-Host "reddit-mcp-buddy bundled."
+        & npm install $PackageName --silent 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "$PackageName install failed" }
+        $EntryPath = Join-Path (Join-Path $TmpDir 'node_modules') $EntrySubpath
+        if (-not (Test-Path $EntryPath)) { throw "$PackageName entry not found at $EntryPath" }
+        $banner = 'const __OPENSWARM_IMPORT_META_URL__ = require("url").pathToFileURL(__filename).href;'
+        & npx esbuild $EntryPath --bundle --platform=node --format=cjs --target=node22 --legal-comments=none `
+            --define:import.meta.url=__OPENSWARM_IMPORT_META_URL__ `
+            "--banner:js=$banner" `
+            "--outfile=$OutFile"
+        if ($LASTEXITCODE -ne 0) { throw "esbuild failed for $PackageName" }
+        Write-Host "$PackageName bundled."
     } finally {
         Pop-Location
         Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     }
-} else {
-    Write-Host "[0b] reddit-mcp-buddy bundle already present."
 }
 
-# --- Step 0c: npm MCP servers that can't be bundled ---
-$NpmServersDir = Join-Path $ProjectRoot 'backend\npm-servers'
-New-Item -ItemType Directory -Force -Path $NpmServersDir | Out-Null
-
-function Install-NpmServer($SubDir, $PackageName) {
-    $TargetDir = Join-Path $NpmServersDir $SubDir
-    $NodeModules = Join-Path $TargetDir 'node_modules'
-    if (Test-Path $NodeModules) {
-        Write-Host "[0c] $PackageName already present."
+# Multi-file bundle. Output is a directory mcp-bundles\<dir>\ that mirrors the
+# upstream SDK's "package_root\dist\index.js + ..\package.json" layout. Use this
+# for packages whose source reads __dirname\..\package.json (for --version) or
+# other sibling data files (e.g. @softeria\ms-365-mcp-server reads endpoints.json).
+function Build-McpBundleDir($PackageName, $EntrySubpath, $OutDirName, $Extras, $External) {
+    $OutDir = Join-Path $McpBundleDir $OutDirName
+    $OutBundle = Join-Path (Join-Path $OutDir 'dist') 'index.js'
+    if ((Test-Path $OutBundle) -and -not $env:OPENSWARM_REBUILD_BUNDLES) {
+        Write-Host "[0b] $PackageName bundle dir already present."
         return
     }
-    Write-Host "[0c] Installing $PackageName..."
-    New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
-    Push-Location $TargetDir
+    Write-Host "[0b] Bundling $PackageName -> $OutDirName\ ..."
+    $TmpDir = Join-Path $env:TEMP "openswarm-mcp-$([guid]::NewGuid())"
+    New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+    if (Test-Path $OutDir) { Remove-Item -Recurse -Force $OutDir }
+    New-Item -ItemType Directory -Force -Path (Join-Path $OutDir 'dist') | Out-Null
+    Push-Location $TmpDir
     try {
-        & npm init -y *>$null
         & npm install $PackageName --silent 2>$null
         if ($LASTEXITCODE -ne 0) { throw "$PackageName install failed" }
-        Write-Host "$PackageName installed."
+        $EntryPath = Join-Path (Join-Path $TmpDir 'node_modules') $EntrySubpath
+        if (-not (Test-Path $EntryPath)) { throw "$PackageName entry not found at $EntryPath" }
+
+        # Stripped sibling package.json (omits "type":"module" so Node treats the CJS bundle correctly)
+        $SdkPkgPath = Join-Path (Join-Path $TmpDir 'node_modules') (Join-Path $PackageName 'package.json')
+        $SdkPkgJson = Get-Content -Raw $SdkPkgPath | ConvertFrom-Json
+        $SdkVersion = $SdkPkgJson.version
+        $StrippedPkg = "{`"name`":`"$PackageName`",`"version`":`"$SdkVersion`"}"
+        Set-Content -Path (Join-Path $OutDir 'package.json') -Value $StrippedPkg -NoNewline
+
+        # Copy sibling data files
+        if ($Extras) {
+            foreach ($pair in $Extras) {
+                $src, $dst = $pair -split '='
+                $srcAbs = Join-Path (Join-Path $TmpDir 'node_modules') $src
+                $dstAbs = Join-Path $OutDir $dst
+                New-Item -ItemType Directory -Force -Path (Split-Path $dstAbs -Parent) | Out-Null
+                Copy-Item -Force $srcAbs $dstAbs
+            }
+        }
+
+        $banner = 'const __OPENSWARM_IMPORT_META_URL__ = require("url").pathToFileURL(__filename).href;'
+        $esbuildArgs = @(
+            $EntryPath, '--bundle', '--platform=node', '--format=cjs',
+            '--target=node22', '--legal-comments=none',
+            '--define:import.meta.url=__OPENSWARM_IMPORT_META_URL__',
+            "--banner:js=$banner",
+            "--outfile=$OutBundle"
+        )
+        if ($External) {
+            foreach ($ext in $External) { $esbuildArgs += "--external:$ext" }
+        }
+        & npx esbuild @esbuildArgs
+        if ($LASTEXITCODE -ne 0) { throw "esbuild failed for $PackageName" }
+        Write-Host "$PackageName bundled."
     } finally {
         Pop-Location
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     }
 }
-Install-NpmServer 'softeria-ms-365-mcp-server' '@softeria/ms-365-mcp-server'
-Install-NpmServer 'notionhq-notion-mcp-server' '@notionhq/notion-mcp-server'
+
+Build-McpBundleSingle 'reddit-mcp-buddy'              'reddit-mcp-buddy/dist/index.js'             'reddit-mcp-buddy.js'
+Build-McpBundleDir    '@notionhq/notion-mcp-server'   '@notionhq/notion-mcp-server/bin/cli.mjs'    `
+                      'notionhq-notion-mcp-server' `
+                      @('@notionhq/notion-mcp-server/scripts/notion-openapi.json=scripts/notion-openapi.json') `
+                      @()
+Build-McpBundleDir    '@softeria/ms-365-mcp-server'   '@softeria/ms-365-mcp-server/dist/index.js' `
+                      'softeria-ms-365-mcp-server' `
+                      @('@softeria/ms-365-mcp-server/dist/endpoints.json=dist/endpoints.json') `
+                      @('keytar')
+
+# Wipe legacy single-file Notion bundle if the dir-style bundle now supersedes it.
+$LegacyNotionFile = Join-Path $McpBundleDir 'notionhq-notion-mcp-server.js'
+$NotionDir = Join-Path $McpBundleDir 'notionhq-notion-mcp-server'
+if ((Test-Path $LegacyNotionFile) -and (Test-Path $NotionDir)) {
+    Remove-Item -Force $LegacyNotionFile
+}
+
+# Defensively wipe any legacy npm-servers/ tree from prior builds so it
+# doesn't ride along into the installer (would re-introduce the ~19k
+# files we just removed by switching to bundling).
+$LegacyNpmServers = Join-Path $ProjectRoot 'backend\npm-servers'
+if (Test-Path $LegacyNpmServers) {
+    Write-Host "[0b] Removing legacy backend\npm-servers\ (now superseded by mcp-bundles)..."
+    Remove-Item -Recurse -Force $LegacyNpmServers
+}
 Write-Host ""
 
 # --- Step 1: Frontend build ---
@@ -197,7 +280,7 @@ function Copy-Excluded($Source, $Dest, $Exclude) {
 
 Copy-Excluded `
     (Join-Path $ProjectRoot 'backend') (Join-Path $Staging 'backend') `
-    @{ Dirs = @('__pycache__','.venv','tools','tests'); Files = @('*.pyc') }
+    @{ Dirs = @('__pycache__','.venv','tools','tests'); Files = @('*.pyc','.env','.env.*') }
 New-Item -ItemType Directory -Force -Path (Join-Path $Staging 'backend\data\tools') | Out-Null
 
 Copy-Excluded `

@@ -77,11 +77,94 @@ let backendProcess = null;
 let backendPort = null;
 let cachedUpdateStatus = { status: 'idle', info: null, error: null };
 
+// Splash boot UX. Opens immediately on app.whenReady so the user sees
+// motion within ~1s of double-click instead of a 30-60s frozen icon
+// while Python imports + Defender real-time scans warm up. Closed once
+// mainWindow is `ready-to-show`. See electron/splash/splash.html.
+let splashWindow = null;
+let mainWindowReady = false;
+let isQuittingFromSplash = false;  // guards against double-quit during error shutdown
+const recentBackendStderr = [];   // ring buffer (last ~60 lines) for splash error UI
+let splashDataUrlCache = null;
+
 const isPackaged = app.isPackaged;
 const isDev = process.env.ELECTRON_DEV === '1';
 const iconPath = process.platform === 'win32'
   ? path.join(__dirname, 'build', 'icon.ico')
   : path.join(__dirname, 'build', 'icon.png');
+// PNG version of the icon for the splash (icon.ico isn't a valid <img src>
+// payload across platforms, but icon.png works everywhere).
+const iconPngPath = path.join(__dirname, 'build', 'icon.png');
+
+function loadSplashDataUrl() {
+  if (splashDataUrlCache) return splashDataUrlCache;
+  try {
+    const html = fs.readFileSync(path.join(__dirname, 'splash', 'splash.html'), 'utf8');
+    const iconBytes = fs.readFileSync(iconPngPath);
+    const iconDataUrl = 'data:image/png;base64,' + iconBytes.toString('base64');
+    const finalHtml = html.replace('__OPENSWARM_LOGO__', iconDataUrl);
+    splashDataUrlCache = 'data:text/html;charset=utf-8;base64,' + Buffer.from(finalHtml).toString('base64');
+    return splashDataUrlCache;
+  } catch (err) {
+    console.warn('[splash] failed to load splash payload:', err && err.message);
+    return null;
+  }
+}
+
+function createSplashWindow() {
+  const dataUrl = loadSplashDataUrl();
+  if (!dataUrl) return null;
+  const w = new BrowserWindow({
+    width: 460,
+    height: 340,
+    frame: false,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,           // avoid duplicate taskbar entry next to mainWindow
+    show: true,
+    center: true,
+    backgroundColor: '#0a0a10',  // opaque to dodge Windows DWM transparency quirks
+    title: 'OpenSwarm',
+    icon: iconPath,
+    webPreferences: {
+      // Splash content is fully self-contained (data URL, no remote
+      // resources) so nodeIntegration here is safe and lets the splash
+      // listen on ipcRenderer directly without a separate preload.
+      nodeIntegration: true,
+      contextIsolation: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  w.setMenuBarVisibility(false);
+  w.loadURL(dataUrl);
+  // If the splash is dismissed BEFORE the main window has shown itself,
+  // treat that as the user intentionally bailing out of boot. Without
+  // this, splash.close() would silently leave a backend running with
+  // no UI, which is confusing and leaks the python process.
+  // The isQuittingFromSplash guard avoids a double-quit when the user
+  // clicked the splash's Quit button (which also calls app.quit) — that
+  // path closes the splash and would re-trigger this branch.
+  w.on('closed', () => {
+    splashWindow = null;
+    if (!mainWindowReady && !isQuittingFromSplash) {
+      isQuittingFromSplash = true;
+      console.log('[splash] closed before main window appeared — quitting app');
+      try { if (!isDev) killBackend(); } catch (_) {}
+      app.quit();
+    }
+  });
+  return w;
+}
+
+function emitSplashStatus(payload) {
+  if (splashWindow && !splashWindow.isDestroyed() && splashWindow.webContents) {
+    try { splashWindow.webContents.send('splash:status', payload); } catch (_) {}
+  }
+}
 
 /**
  * macOS GUI apps launched from Finder/Dock inherit a minimal PATH from launchd
@@ -182,16 +265,52 @@ function getPythonPath() {
   return path.join(__dirname, '..', 'backend', '.venv', 'bin', 'python3');
 }
 
-function waitForBackend(port, timeoutMs = 60000) {
+// Polls /api/health/check until the backend answers 200, or the spawned
+// python process exits non-zero (real failure). Never times out by wall
+// clock — on a cold-Defender Windows install this can take several
+// minutes the first time, and silently calling app.quit() would leave
+// users staring at a vanished icon. Instead we surface progressive
+// warnings on the splash so the wait feels intentional.
+function waitForBackend(port, opts = {}) {
+  const proc = opts.process || null;
   const start = Date.now();
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let stillStartingNotified = false;
+    let actionsShown = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; fn(val); };
+
+    if (proc) {
+      proc.once('exit', (code) => {
+        // exit with code === null means we killed it ourselves (normal shutdown).
+        if (code !== 0 && code !== null) {
+          finish(reject, new Error(`Backend process exited with code ${code} during startup`));
+        }
+      });
+    }
+
     function check() {
-      if (Date.now() - start > timeoutMs) {
-        return reject(new Error('Backend startup timed out'));
+      if (settled) return;
+      const elapsed = Date.now() - start;
+      if (elapsed > 60_000 && !stillStartingNotified) {
+        stillStartingNotified = true;
+        emitSplashStatus({
+          text: 'Still starting (first launch can take 2-3 minutes on Windows while Defender scans)…',
+          level: 'warning',
+        });
+      }
+      if (elapsed > 180_000 && !actionsShown) {
+        actionsShown = true;
+        emitSplashStatus({
+          text: 'Backend is taking unusually long. You can wait, view logs, or restart.',
+          level: 'warning',
+          showActions: true,
+          logs: recentBackendStderr.slice(-20).join(''),
+        });
       }
       const req = http.get(`http://127.0.0.1:${port}/api/health/check`, (res) => {
         if (res.statusCode === 200) {
-          resolve();
+          finish(resolve);
         } else {
           setTimeout(check, 500);
         }
@@ -206,8 +325,29 @@ function waitForBackend(port, timeoutMs = 60000) {
   });
 }
 
+// Race a port-range search against a 3-second wall clock. On most machines
+// `getPort.makeRange(8324, 8424)` returns within milliseconds, but Windows
+// EDR / corp-firewall stacks can intercept the bind() probes and stall each
+// attempt for seconds — 100 attempts × multi-second stalls = "OpenSwarm is
+// hung at startup." The fallback `getPort({ port: 0 })` lets the OS pick
+// any free ephemeral port; we don't actually care about staying inside the
+// 8324-range — the renderer reads the port via IPC, no hardcoded assumption.
+async function pickBackendPort() {
+  const PREFERRED_TIMEOUT_MS = 3000;
+  const preferred = getPort({ port: getPort.makeRange(8324, 8424) });
+  let timeoutHandle;
+  const timeout = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => resolve(null), PREFERRED_TIMEOUT_MS);
+  });
+  const winner = await Promise.race([preferred, timeout]);
+  clearTimeout(timeoutHandle);
+  if (winner !== null) return winner;
+  console.warn(`[boot] getPort.makeRange(8324,8424) stalled past ${PREFERRED_TIMEOUT_MS}ms — falling back to OS-assigned port`);
+  return await getPort({ port: 0 });
+}
+
 async function startBackend() {
-  backendPort = await getPort({ port: getPort.makeRange(8324, 8424) });
+  backendPort = await pickBackendPort();
 
   const pythonPath = getPythonPath();
   const backendDir = getResourcePath('backend');
@@ -253,11 +393,22 @@ async function startBackend() {
   backendProcess.stdout.on('data', (data) => {
     const text = data.toString();
     process.stdout.write(`[backend] ${text}`);
+    // uvicorn prints this exact phrase once the ASGI app is live and
+    // routes are mounted — perfect milestone for the splash to flip
+    // from "starting backend" to "loading components".
+    if (text.indexOf('Application startup complete') !== -1) {
+      emitSplashStatus('Loading components…');
+    }
   });
 
   backendProcess.stderr.on('data', (data) => {
     const text = data.toString();
     process.stderr.write(`[backend] ${text}`);
+    // Buffer the most recent stderr lines for the splash error UI so
+    // when boot fails we can show actionable context inline instead of
+    // making the user dig through a log file.
+    recentBackendStderr.push(text);
+    while (recentBackendStderr.length > 60) recentBackendStderr.shift();
   });
 
   backendProcess.on('exit', (code) => {
@@ -269,7 +420,8 @@ async function startBackend() {
     }
   });
 
-  await waitForBackend(backendPort);
+  emitSplashStatus('Starting backend…');
+  await waitForBackend(backendPort, { process: backendProcess });
   console.log(`Backend ready on port ${backendPort}`);
 
   // Backend writes a per-install auth token file at startup. Read it
@@ -334,6 +486,12 @@ function createWindow() {
     title: 'OpenSwarm',
     icon: iconPath,
     titleBarStyle: 'hiddenInset',
+    // Stay hidden until the renderer fires `ready-to-show`. The splash
+    // is what the user looks at; we swap it out for this window only
+    // once React has actually painted, avoiding the white-flash that
+    // Electron windows do during initial layout.
+    show: false,
+    backgroundColor: '#1a1a1f',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -516,30 +674,43 @@ app.whenReady().then(async () => {
     },
   );
 
-  // Wait for the Widevine CDM to be downloaded/ready (CastLabs Component
-  // Updater Service). On first launch this downloads the CDM; subsequent
-  // launches use the cached version.
+  // Splash window opens immediately so the user sees motion within ~1s
+  // of double-clicking. Without this, on a cold-Defender Windows install
+  // the dock/taskbar icon flashes for 30-60s with nothing visible.
+  splashWindow = createSplashWindow();
+  emitSplashStatus('Starting OpenSwarm…');
+
+  // Widevine CDM and backend startup are independent — run them
+  // concurrently. Backend is the long pole on Windows (Defender + Python
+  // cold start), so we don't want a slow CDM download to add seconds to
+  // every boot. Webviews that need DRM still wait on `components.whenReady`
+  // before loading via the existing webview-preload flow, so parallelizing
+  // here is safe.
+  let widevinePromise;
   if (components && typeof components.whenReady === 'function') {
-    try {
-      await components.whenReady();
-      console.log('Widevine CDM ready');
-      if (typeof components.status === 'function') {
-        console.log('CDM component status:', JSON.stringify(components.status()));
-      }
-    } catch (err) {
-      console.warn('Widevine CDM not available:', err.message);
-    }
+    widevinePromise = components.whenReady().then(
+      () => {
+        console.log('Widevine CDM ready');
+        if (typeof components.status === 'function') {
+          console.log('CDM component status:', JSON.stringify(components.status()));
+        }
+      },
+      (err) => { console.warn('Widevine CDM not available:', err && err.message); }
+    );
   } else {
     console.log('CastLabs components API not available — using standard Electron (no DRM)');
+    widevinePromise = Promise.resolve();
   }
 
   try {
     if (isDev) {
       backendPort = parseInt(process.env.OPENSWARM_PORT || '8324', 10);
       console.log(`Dev mode: using existing backend on port ${backendPort}`);
+      emitSplashStatus('Connecting to dev backend…');
     } else {
       await startBackend();
     }
+    emitSplashStatus('Almost ready…');
     createWindow();
     if (!isDev) {
       setupAutoUpdater();
@@ -551,9 +722,51 @@ app.whenReady().then(async () => {
         }
       });
     }
+
+    // Swap splash → main only once React has actually painted. ready-to-show
+    // fires after the renderer's first frame, eliminating the white-flash
+    // that would otherwise pop between splash close and React mount.
+    if (mainWindow) {
+      const swapToMain = () => {
+        if (mainWindowReady || mainWindow.isDestroyed()) return;
+        mainWindowReady = true;
+        try { mainWindow.show(); mainWindow.focus(); } catch (_) {}
+        // Tiny delay so the OS gets a chance to bring main to front
+        // before splash disappears — avoids a single-frame "no window"
+        // gap on Windows.
+        setTimeout(() => {
+          if (splashWindow && !splashWindow.isDestroyed()) {
+            splashWindow.destroy();
+          }
+          splashWindow = null;
+        }, 120);
+      };
+      mainWindow.once('ready-to-show', swapToMain);
+      // Fallback: if the renderer fails to load (e.g. dev server not
+      // running on localhost:3000), `ready-to-show` never fires and
+      // the splash would hang forever. Show main anyway so the dev
+      // sees the load error in the window itself.
+      mainWindow.webContents.once('did-fail-load', (_e, errorCode, errorDescription, validatedURL) => {
+        console.warn('[boot] mainWindow load failed:', errorCode, errorDescription, validatedURL);
+        if (isDev) swapToMain();
+      });
+    }
+
+    // Don't block on Widevine; it'll resolve in the background. Logged above.
+    widevinePromise.catch(() => {});
   } catch (err) {
     console.error('Failed to start:', err);
-    app.quit();
+    // Surface the failure on the splash instead of silently quitting.
+    // The user picks: view logs, restart, or quit. This eliminates the
+    // class of "I clicked OpenSwarm and nothing happened" reports.
+    emitSplashStatus({
+      text: "OpenSwarm couldn't start: " + (err && err.message ? err.message : String(err)),
+      level: 'error',
+      showActions: true,
+      logs: recentBackendStderr.slice(-30).join(''),
+    });
+    // Do NOT call app.quit() here — the user controls the next step
+    // through the splash action buttons.
   }
 });
 
@@ -802,6 +1015,31 @@ app.on('will-quit', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0 && backendPort) {
     createWindow();
+  }
+});
+
+// Splash window action buttons. Only meaningful while splashWindow is alive
+// (during boot or in the post-failure error state). Sent via ipcRenderer.send
+// from electron/splash/splash.html.
+ipcMain.on('splash:action', (_event, action) => {
+  if (action === 'quit') {
+    isQuittingFromSplash = true;
+    app.quit();
+  } else if (action === 'restart') {
+    // app.relaunch + app.exit is the canonical Electron restart pattern.
+    // killBackend runs via the will-quit listener so the python child
+    // gets cleaned up before we re-spawn ourselves.
+    app.relaunch();
+    app.exit(0);
+  } else if (action === 'open-logs') {
+    // No backend log file is written to disk today; the next-best thing
+    // is opening the OpenSwarm data dir, where the user can see the
+    // auth.token file and any future log artifacts. Surfacing the dir
+    // also lets advanced users self-serve (clear data, etc).
+    try {
+      const dataDir = path.dirname(getAuthTokenFilePath());
+      shell.openPath(dataDir).catch(() => {});
+    } catch (_) {}
   }
 });
 

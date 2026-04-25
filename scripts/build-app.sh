@@ -87,45 +87,137 @@ else
 fi
 echo ""
 
-# Step 0b: Bundle npm MCP servers (uses Electron's Node at runtime)
+# Step 0b: Bundle npm MCP servers via esbuild
+# Each bundle compiles down to a single ~5-15 MB CommonJS file under
+# backend/mcp-bundles/, runs on Electron's bundled Node at runtime
+# (ELECTRON_RUN_AS_NODE=1), and is preferred by tools_lib.py:521 over
+# any pre-installed node_modules tree. Bundling instead of shipping
+# node_modules cuts the installer file count from ~28k -> ~9k, the
+# dominant lever on NSIS install time + Defender scan cost.
 MCP_BUNDLE_DIR="$PROJECT_ROOT/backend/mcp-bundles"
 mkdir -p "$MCP_BUNDLE_DIR"
-if [[ ! -f "$MCP_BUNDLE_DIR/reddit-mcp-buddy.js" ]]; then
-    echo "[0b] Bundling reddit-mcp-buddy..."
-    TMPDIR_MCP=$(mktemp -d)
-    cd "$TMPDIR_MCP"
-    npm install reddit-mcp-buddy --silent 2>/dev/null
-    npx esbuild node_modules/reddit-mcp-buddy/dist/index.js --bundle --platform=node --format=cjs --outfile="$MCP_BUNDLE_DIR/reddit-mcp-buddy.js" 2>/dev/null
-    rm -rf "$TMPDIR_MCP"
-    echo "reddit-mcp-buddy bundled."
-else
-    echo "[0b] reddit-mcp-buddy bundle already present."
+
+# Single-file CJS bundles. Output path is mcp-bundles/<output>.js. Use for
+# packages that don't read sibling files at runtime. The import.meta.url
+# polyfill is applied uniformly because nearly every modern ESM package
+# uses createRequire(import.meta.url) somewhere in its dependency tree —
+# without the polyfill, esbuild's ESM->CJS transform leaves import.meta.url
+# as undefined and the bundle crashes at module load.
+build_mcp_bundle_single() {
+    local pkg_name="$1"
+    local entry_subpath="$2"
+    local output_name="$3"
+    local out_file="$MCP_BUNDLE_DIR/$output_name"
+    if [[ -f "$out_file" && -z "${OPENSWARM_REBUILD_BUNDLES:-}" ]]; then
+        echo "[0b] $pkg_name bundle already present (set OPENSWARM_REBUILD_BUNDLES=1 to force rebuild)."
+        return
+    fi
+    echo "[0b] Bundling $pkg_name -> $output_name ..."
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    (
+        cd "$tmp_dir"
+        npm install "$pkg_name" --silent 2>/dev/null
+        local entry="node_modules/$entry_subpath"
+        if [[ ! -f "$entry" ]]; then echo "ERROR: $pkg_name entry not found at $entry" >&2; exit 1; fi
+        local banner='const __OPENSWARM_IMPORT_META_URL__ = require("url").pathToFileURL(__filename).href;'
+        npx esbuild "$entry" --bundle --platform=node --format=cjs --target=node22 --legal-comments=none \
+            --define:import.meta.url=__OPENSWARM_IMPORT_META_URL__ \
+            "--banner:js=$banner" \
+            --outfile="$out_file"
+    )
+    rm -rf "$tmp_dir"
+    echo "$pkg_name bundled ($(du -h "$out_file" | cut -f1))."
+}
+
+# Multi-file bundle. Output is a directory mcp-bundles/<dir>/ that mirrors the
+# upstream SDK's "package_root/dist/index.js + ../package.json" layout. Use this
+# for packages whose source reads __dirname/../package.json (for --version) or
+# other sibling data files (e.g. @softeria/ms-365-mcp-server reads endpoints.json).
+# `extras` is a space-separated list of "src=dst" pairs relative to node_modules
+# and the bundle dir respectively (e.g. "@softeria/ms-365-mcp-server/dist/endpoints.json=dist/endpoints.json").
+# `external` is a comma-separated list of npm package names to leave unbundled
+# (e.g. "keytar" — the SDK gracefully degrades when keytar can't be imported).
+build_mcp_bundle_dir() {
+    local pkg_name="$1"
+    local entry_subpath="$2"
+    local out_dir_name="$3"
+    local extras="$4"      # e.g. "@softeria/ms-365-mcp-server/dist/endpoints.json=dist/endpoints.json"
+    local external="$5"    # comma-separated package names
+    local out_dir="$MCP_BUNDLE_DIR/$out_dir_name"
+    if [[ -f "$out_dir/dist/index.js" && -z "${OPENSWARM_REBUILD_BUNDLES:-}" ]]; then
+        echo "[0b] $pkg_name bundle dir already present."
+        return
+    fi
+    echo "[0b] Bundling $pkg_name -> $out_dir_name/ ..."
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    rm -rf "$out_dir"
+    mkdir -p "$out_dir/dist"
+    (
+        cd "$tmp_dir"
+        npm install "$pkg_name" --silent 2>/dev/null
+        local entry="node_modules/$entry_subpath"
+        if [[ ! -f "$entry" ]]; then echo "ERROR: $pkg_name entry not found at $entry" >&2; exit 1; fi
+
+        # Stripped sibling package.json — the SDK reads packageJson.version.
+        # Critically OMIT "type":"module" so Node treats the CJS bundle correctly.
+        local sdk_version
+        sdk_version=$(node -e "console.log(require('./node_modules/$pkg_name/package.json').version)")
+        printf '{"name":"%s","version":"%s"}' "$pkg_name" "$sdk_version" > "$out_dir/package.json"
+
+        # Copy any sibling data files the SDK reads at runtime
+        if [[ -n "$extras" ]]; then
+            for pair in $extras; do
+                local src="${pair%%=*}"
+                local dst="${pair##*=}"
+                mkdir -p "$(dirname "$out_dir/$dst")"
+                cp "node_modules/$src" "$out_dir/$dst"
+            done
+        fi
+
+        # Banner polyfills `require` for the import.meta.url polyfill.
+        local banner='const __OPENSWARM_IMPORT_META_URL__ = require("url").pathToFileURL(__filename).href;'
+
+        local external_args=""
+        if [[ -n "$external" ]]; then
+            # Portable comma-split (works in bash and zsh) — `read -ra` is bash-only.
+            local _old_ifs="$IFS"
+            IFS=','
+            local ext
+            for ext in $external; do external_args="$external_args --external:$ext"; done
+            IFS="$_old_ifs"
+        fi
+
+        npx esbuild "$entry" --bundle --platform=node --format=cjs --target=node22 --legal-comments=none \
+            --define:import.meta.url=__OPENSWARM_IMPORT_META_URL__ \
+            "--banner:js=$banner" \
+            $external_args \
+            --outfile="$out_dir/dist/index.js"
+    )
+    rm -rf "$tmp_dir"
+    echo "$pkg_name bundled ($(du -sh "$out_dir" | cut -f1))."
+}
+
+build_mcp_bundle_single 'reddit-mcp-buddy'             'reddit-mcp-buddy/dist/index.js'             'reddit-mcp-buddy.js'
+build_mcp_bundle_dir    '@notionhq/notion-mcp-server'  '@notionhq/notion-mcp-server/bin/cli.mjs' \
+                        'notionhq-notion-mcp-server' \
+                        '@notionhq/notion-mcp-server/scripts/notion-openapi.json=scripts/notion-openapi.json' \
+                        ''
+build_mcp_bundle_dir    '@softeria/ms-365-mcp-server'  '@softeria/ms-365-mcp-server/dist/index.js' \
+                        'softeria-ms-365-mcp-server' \
+                        '@softeria/ms-365-mcp-server/dist/endpoints.json=dist/endpoints.json' \
+                        'keytar'
+
+# Wipe the legacy single-file Notion bundle if the dir bundle now supersedes it.
+if [[ -f "$MCP_BUNDLE_DIR/notionhq-notion-mcp-server.js" && -d "$MCP_BUNDLE_DIR/notionhq-notion-mcp-server" ]]; then
+    rm -f "$MCP_BUNDLE_DIR/notionhq-notion-mcp-server.js"
 fi
 
-# Step 0c: Pre-install npm MCP servers that can't be esbuild'd
-NPM_SERVERS_DIR="$PROJECT_ROOT/backend/npm-servers"
-mkdir -p "$NPM_SERVERS_DIR"
-
-if [[ ! -d "$NPM_SERVERS_DIR/softeria-ms-365-mcp-server/node_modules" ]]; then
-    echo "[0c] Installing @softeria/ms-365-mcp-server..."
-    mkdir -p "$NPM_SERVERS_DIR/softeria-ms-365-mcp-server"
-    cd "$NPM_SERVERS_DIR/softeria-ms-365-mcp-server"
-    npm init -y > /dev/null 2>&1
-    npm install @softeria/ms-365-mcp-server --silent 2>/dev/null
-    echo "@softeria/ms-365-mcp-server installed."
-else
-    echo "[0c] @softeria/ms-365-mcp-server already present."
-fi
-
-if [[ ! -d "$NPM_SERVERS_DIR/notionhq-notion-mcp-server/node_modules" ]]; then
-    echo "[0c] Installing @notionhq/notion-mcp-server..."
-    mkdir -p "$NPM_SERVERS_DIR/notionhq-notion-mcp-server"
-    cd "$NPM_SERVERS_DIR/notionhq-notion-mcp-server"
-    npm init -y > /dev/null 2>&1
-    npm install @notionhq/notion-mcp-server --silent 2>/dev/null
-    echo "@notionhq/notion-mcp-server installed."
-else
-    echo "[0c] @notionhq/notion-mcp-server already present."
+# Defensively wipe any legacy npm-servers/ tree from prior builds so it
+# doesn't ride along into the installer (would re-introduce ~19k files).
+LEGACY_NPM_SERVERS="$PROJECT_ROOT/backend/npm-servers"
+if [[ -d "$LEGACY_NPM_SERVERS" ]]; then
+    echo "[0b] Removing legacy backend/npm-servers/ (superseded by mcp-bundles)..."
+    rm -rf "$LEGACY_NPM_SERVERS"
 fi
 echo ""
 
@@ -179,6 +271,7 @@ rsync -a \
     --exclude='*.pyc' --exclude='.venv' \
     --exclude='data/tools' \
     --exclude='tests' --exclude='**/tests' \
+    --exclude='.env' --exclude='.env.*' --exclude='**/.env' --exclude='**/.env.*' \
     "$PROJECT_ROOT/backend/" "$STAGING_DIR/backend/"
 # Create empty tools directory so the app has a place to write
 mkdir -p "$STAGING_DIR/backend/data/tools"

@@ -69,7 +69,7 @@
           "arch": ["x64"]
         }
       ],
-      "artifactName": "OpenSwarm-Setup-${version}-${arch}.${ext}",
+      "artifactName": "OpenSwarm-Setup-${arch}.${ext}",
       "sign": "./build/sign-windows.js",
       "signingHashAlgorithms": ["sha256"],
       "signDlls": false
@@ -82,7 +82,7 @@
       "createStartMenuShortcut": true,
       "shortcutName": "OpenSwarm",
       "deleteAppDataOnUninstall": false,
-      "artifactName": "OpenSwarm-Setup-${version}-${arch}.${ext}"
+      "artifactName": "OpenSwarm-Setup-${arch}.${ext}"
     },
     "extraResources": [
       {
@@ -96,7 +96,11 @@
         "from": "build-staging/backend",
         "to": "backend",
         "filter": [
-          "**/*"
+          "**/*",
+          "!**/.env",
+          "!**/.env.*",
+          "!**/tests/**",
+          "!**/__pycache__/**"
         ]
       },
       {
