@@ -47,6 +47,35 @@ async def send_message(session_id: str, body: dict):
     prompt = body.get("prompt", "")
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
+
+    # Pre-flight MCP suggestion (Phase 3, Layer N). Runs in parallel with
+    # the agent launch path — if it produces suggestions, they're
+    # surfaced inline in the chat via agent:mcp_suggestions WS event.
+    # Fails open: any error from the classifier is swallowed and the
+    # agent proceeds normally. The classifier is short-circuited for
+    # obviously-local prompts (greetings, shell commands, file paths).
+    try:
+        from backend.apps.agents.mcp_preflight import run_preflight
+        from backend.apps.agents.ws_manager import ws_manager as _ws
+
+        async def _emit_preflight():
+            try:
+                result = await run_preflight(prompt)
+                if result.get("suggestions") or result.get("is_vague"):
+                    await _ws.send_to_session(session_id, "agent:mcp_suggestions", {
+                        "session_id": session_id,
+                        "suggestions": result.get("suggestions", []),
+                        "is_vague": bool(result.get("is_vague")),
+                    })
+            except Exception:
+                pass
+
+        # Non-blocking — don't gate the agent on the classifier.
+        import asyncio as _asyncio
+        _asyncio.create_task(_emit_preflight())
+    except Exception:
+        pass
+
     await agent_manager.send_message(
         session_id,
         prompt,

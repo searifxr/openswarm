@@ -471,7 +471,7 @@ const Tools: React.FC = () => {
   const c = useClaudeTokens();
   const dispatch = useAppDispatch();
   const { items, builtinTools, builtinPermissions, loading } = useAppSelector((s) => s.tools);
-  const { servers: regServers, total: regTotal, loading: regLoading, stats: regStats, detail: regDetail, detailLoading: regDetailLoading } = useAppSelector((s) => s.mcpRegistry);
+  const { servers: regServersRaw, total: regTotal, loading: regLoading, stats: regStats, detail: regDetail, detailLoading: regDetailLoading } = useAppSelector((s) => s.mcpRegistry);
   const devMode = useAppSelector((s) => s.settings.data.dev_mode);
   const outputItems = useAppSelector((s) => s.outputs.items);
   const outputs = useMemo(() => Object.values(outputItems), [outputItems]);
@@ -502,7 +502,28 @@ const Tools: React.FC = () => {
   const [registryOpen, setRegistryOpen] = useState(false);
   const [regQuery, setRegQuery] = useState('');
   const [regSort, setRegSort] = useState<'name' | 'stars'>('stars');
-  const [regSource, setRegSource] = useState<'' | 'community' | 'google'>('');
+  // Default 'curated' (Phase 2): the registry has thousands of community
+  // servers but most users only ever want the vetted set. Toggle to ''
+  // to see everything. The curated filter is purely client-side: the
+  // backend still returns the full list, we just hide the long tail.
+  const [regSource, setRegSource] = useState<'' | 'community' | 'google' | 'curated'>('curated');
+
+  // Curated whitelist for the default registry view (Phase 2). Matches
+  // the per-server search alias map in main.py (mcp-meta) so the same
+  // 9 servers we recommend in MCPSearch are the ones the user sees by
+  // default in the Tools registry. Toggle to "All" / "Community" to
+  // browse the long tail.
+  const CURATED_MCP_NAMES = useMemo(() => new Set([
+    'google-workspace', 'microsoft-365', 'slack', 'discord',
+    'notion', 'airtable', 'hubspot', 'reddit', 'youtube',
+  ]), []);
+  const regServers = useMemo(() => {
+    if (regSource !== 'curated') return regServersRaw;
+    return regServersRaw.filter((srv: any) => {
+      const id = (srv?.name || srv?.id || '').toLowerCase();
+      return CURATED_MCP_NAMES.has(id);
+    });
+  }, [regServersRaw, regSource, CURATED_MCP_NAMES]);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
   const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity?: 'success' | 'error' }>({ open: false, message: '' });
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -756,32 +777,38 @@ const Tools: React.FC = () => {
 
   // --------------- Registry browser ---------------
 
-  const handleRegSearch = useCallback((q: string, sort?: 'name' | 'stars', source?: '' | 'community' | 'google') => {
+  // Translate the UI's "curated" pseudo-source into "" for the backend
+  // (which doesn't know that filter) — the curated whitelist is applied
+  // client-side via the regServers memo above.
+  const _backendSource = (s: '' | 'community' | 'google' | 'curated'): '' | 'community' | 'google' =>
+    s === 'curated' ? '' : s;
+
+  const handleRegSearch = useCallback((q: string, sort?: 'name' | 'stars', source?: '' | 'community' | 'google' | 'curated') => {
     setRegQuery(q);
     setExpandedServer(null);
     const sortVal = sort ?? regSort;
     const sourceVal = source ?? regSource;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      dispatch(searchRegistry({ q, limit: 20, offset: 0, sort: sortVal, source: sourceVal }));
+      dispatch(searchRegistry({ q, limit: 20, offset: 0, sort: sortVal, source: _backendSource(sourceVal) }));
     }, 300);
   }, [dispatch, regSort, regSource]);
 
   const handleLoadMore = () => {
-    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: regServers.length, sort: regSort, source: regSource }));
+    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: regServersRaw.length, sort: regSort, source: _backendSource(regSource) }));
   };
 
   const handleRegSort = (sort: 'name' | 'stars') => {
     setRegSort(sort);
     setExpandedServer(null);
-    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: 0, sort, source: regSource }));
+    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: 0, sort, source: _backendSource(regSource) }));
   };
 
-  const handleRegSourceFilter = (_: React.MouseEvent<HTMLElement>, val: '' | 'community' | 'google') => {
+  const handleRegSourceFilter = (_: React.MouseEvent<HTMLElement>, val: '' | 'community' | 'google' | 'curated') => {
     if (val === null) return;
     setRegSource(val);
     setExpandedServer(null);
-    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: 0, sort: regSort, source: val }));
+    dispatch(searchRegistry({ q: regQuery, limit: 20, offset: 0, sort: regSort, source: _backendSource(val) }));
   };
 
   const openMcpConfigDialog = (srv: McpServer) => {
@@ -1869,6 +1896,7 @@ const Tools: React.FC = () => {
                 },
               }}
             >
+              <ToggleButton value="curated">Curated</ToggleButton>
               <ToggleButton value="">All</ToggleButton>
               <ToggleButton value="community"><PublicIcon sx={{ fontSize: 14, mr: 0.5 }} />Community</ToggleButton>
               <ToggleButton value="google"><CloudIcon sx={{ fontSize: 14, mr: 0.5 }} />Google</ToggleButton>

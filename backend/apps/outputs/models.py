@@ -34,6 +34,11 @@ class Output(BaseModel):
     workspace_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+    # Usage stats: bumped by RenderOutput dispatch + OutputActivate. Drives
+    # ranking in OutputSearch so frequently-used Outputs surface first.
+    # Both default to absent for backward compat with old on-disk records.
+    last_used_at: Optional[str] = None
+    use_count: int = 0
 
     @model_validator(mode="before")
     @classmethod

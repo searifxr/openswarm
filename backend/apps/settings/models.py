@@ -62,6 +62,11 @@ class AppSettings(BaseModel):
     user_email: Optional[str] = None
     user_use_case: Optional[str] = None
     user_referral_source: Optional[str] = None
+    # Per-MCP dismissal map for the preflight suggestion modal. Keyed by
+    # the curated ToolDefinition.name (e.g. "Google Workspace"); value is
+    # an ISO timestamp of dismissal. Used by mcp_preflight._build_available_shortlist
+    # to suppress suggestions the user has explicitly waved off.
+    dismissed_mcp_suggestions: dict[str, str] = Field(default_factory=dict)
     # Analytics: opted in by default, user can toggle off
     analytics_opt_in: bool = True
     installation_id: Optional[str] = None

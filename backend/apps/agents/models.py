@@ -77,6 +77,14 @@ class AgentSession(BaseModel):
     browser_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     needs_fork: bool = False
+    # Set when MCPActivate (or analogous activation) wants the agent to
+    # auto-continue immediately after the current turn ends — without
+    # requiring the user to type another message. The agent loop reads
+    # this at the end of `_run_agent_loop`; if set, it clears it and
+    # dispatches a new hidden turn with `pending_continuation_prompt` as
+    # the prompt. Race-free vs. the original asyncio-task approach.
+    pending_continuation: bool = False
+    pending_continuation_prompt: Optional[str] = None
     # Sanitized server names (matching tools_lib._sanitize_server_name) of MCP
     # servers the model has explicitly activated this session via the
     # MCPActivate meta-tool. Empty by default — the gate in
@@ -86,6 +94,29 @@ class AgentSession(BaseModel):
     # filter lives at the dispatch layer (mcp_servers passed to the SDK),
     # not the prompt layer.
     active_mcps: list[str] = Field(default_factory=list)
+    # Output ids the model has activated this session via the
+    # OutputActivate meta-tool. Empty by default — _build_outputs_context
+    # only emits the cheap one-line index for unactivated outputs; full
+    # input_schema is shipped only for the ids in this list. Same gate
+    # pattern as active_mcps but for the Outputs/Views surface.
+    active_outputs: list[str] = Field(default_factory=list)
+    # Compaction state. compact_threshold_pct is the live ctx_used ratio
+    # that triggers _maybe_compact at the next turn boundary — turn-based
+    # thresholds break under uneven workloads (one big Bash dump fills
+    # context fast; 30 chitchat turns barely move it). 0.65 = 130K of the
+    # 200K standard tier. compacted_through_msg_id is the last message id
+    # covered by the most recent summary so we don't re-summarize on
+    # every turn.
+    compact_threshold_pct: float = 0.65
+    compacted_through_msg_id: Optional[str] = None
+    # Pre-send hard guard. Fires later than the compaction threshold —
+    # 0.90 of 200K = 180K — to give the auto-compact path a chance to
+    # bring the request back under the ceiling. If still over after
+    # compaction, LRU-trim the oldest active_outputs / active_mcps. Past
+    # this we surface the friendly context-overflow card instead of
+    # letting a 429 hit.
+    context_soft_cap_pct: float = 0.90
+    context_window: int = 200_000
     # How much the model should "think" before answering. Provider-agnostic
     # value that gets translated per-API in agent_manager:
     #   off    — no thinking

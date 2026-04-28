@@ -13,6 +13,7 @@ import {
   updateSessionCost,
   updateSessionContext,
   setContextOverflow,
+  setMcpSuggestions,
   addBranch,
   setActiveBranch,
   closeSessionFromWs,
@@ -304,6 +305,16 @@ class WebSocketManager {
             sessionId: session_id,
             reason: data.reason ?? 'auth_error',
             message: data.message ?? 'Authentication failed.',
+          }));
+        }
+        break;
+
+      case 'agent:mcp_suggestions':
+        if (session_id) {
+          store.dispatch(setMcpSuggestions({
+            sessionId: session_id,
+            suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+            isVague: !!data.is_vague,
           }));
         }
         break;

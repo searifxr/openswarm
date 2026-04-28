@@ -467,34 +467,54 @@ class AgentManager:
             + "\n</connected_mcp_tools>"
         )
 
-    def _build_outputs_context(self) -> str | None:
-        """One-line index of available Outputs.
+    def _build_outputs_context(self, active_outputs: list[str] | None = None) -> str | None:
+        """Outputs context for the system prompt.
 
-        Previously dumped each Output's full json.dumps(input_schema) every
-        turn, which grew without bound and was the dominant non-MCP source of
-        per-request bloat. Now we emit a compact index (name + id +
-        description) plus a hint that full schemas are fetched on demand by
-        RenderOutput. This drops typical 5-Output context from ~6KB to ~400B,
-        and a 30-Output context from ~30KB to ~2KB.
+        Two-mode emission gated by session.active_outputs:
+          - Cheap one-line index for ALL Outputs (name + id + description)
+            so the model can OutputSearch / OutputActivate against them.
+          - FULL input_schema only for the ids in active_outputs. Defaults
+            to empty: nothing ships full-schema until the model has
+            explicitly activated the Output.
+
+        This drops typical 30-Output context from ~30KB to ~2KB at
+        steady state; an active Output adds ~1KB back per id.
         """
+        import json as _json
         all_outputs = load_all_outputs()
         if not all_outputs:
             return None
 
-        lines = []
+        active_set = set(active_outputs or [])
+        index_lines = []
+        full_schemas: list[str] = []
         for out in all_outputs:
             desc = f" — {out.description}" if out.description else ""
-            lines.append(f"- `{out.id}` **{out.name}**{desc}")
+            marker = " [active]" if out.id in active_set else ""
+            index_lines.append(f"- `{out.id}` **{out.name}**{desc}{marker}")
+            if out.id in active_set:
+                schema_str = _json.dumps(out.input_schema, indent=2)
+                full_schemas.append(
+                    f"### `{out.id}` ({out.name})\n```json\n{schema_str}\n```"
+                )
 
-        return (
-            "<available_views>\n"
-            "The following reusable View artifacts are available. Pass the "
-            "output_id below to RenderOutput along with input_data that matches "
-            "the View's schema. RenderOutput will surface schema validation "
-            "errors if the input shape is wrong.\n\n"
-            + "\n".join(lines)
-            + "\n</available_views>"
+        sections = ["<available_views>"]
+        sections.append(
+            "The following reusable View artifacts are available. The model "
+            "must call OutputActivate(output_id) before RenderOutput so that "
+            "the schema is in context — otherwise RenderOutput input_data may "
+            "be malformed. Activated Outputs appear under <activated_view_schemas> "
+            "below."
         )
+        sections.append("")
+        sections.extend(index_lines)
+        sections.append("</available_views>")
+        if full_schemas:
+            sections.append("")
+            sections.append("<activated_view_schemas>")
+            sections.extend(full_schemas)
+            sections.append("</activated_view_schemas>")
+        return "\n".join(sections)
 
     def _build_browser_context(self, dashboard_id: str | None, selected_browser_ids: list[str] | None = None) -> str | None:
         """Build a context block listing browser cards and delegation instructions.
@@ -618,8 +638,43 @@ class AgentManager:
             "be prompted to approve activation. After approval, the server's "
             "tools (`mcp__<server>__<tool>`) become callable on the next turn."
         )
+        sections.append("")
+        sections.append("## CRITICAL behavioral rules (follow these exactly)")
+        sections.append(
+            "1. If the user's request implies an integration listed below "
+            "(email, calendar, slack, notion, etc.) and that server is NOT "
+            "in the Active section, your FIRST tool call MUST be MCPSearch "
+            "or MCPActivate. Do NOT call any other tool that looks like an "
+            "auth/login helper (e.g. `mcp__*__authenticate`, "
+            "`mcp__claude_ai_*__authenticate`) — those are legacy shims "
+            "and will not work. Always go through MCPActivate."
+        )
+        sections.append(
+            "2. After MCPActivate returns, end your turn cleanly. The "
+            "system will automatically run a follow-up turn with the "
+            "newly-activated tools available — you do NOT need the user "
+            "to re-prompt. Just stop and let the next turn fire."
+        )
+        sections.append(
+            "3. Do not ask the user 'should I activate X?' before calling "
+            "MCPActivate — MCPActivate already triggers an explicit user "
+            "approval prompt via the standard tool-approval UI. Asking "
+            "again wastes a round-trip."
+        )
+        sections.append("")
+        sections.append("## Worked example")
+        sections.append(
+            "User: \"check my email\"\n"
+            "Active MCPs: (none)\n"
+            "Available MCPs: google-workspace, microsoft-365\n"
+            "→ Your first tool call is `MCPActivate(server_name=\"google-workspace\", reason=\"checking inbox\")`.\n"
+            "  After it returns, end your turn. Next turn, call "
+            "`mcp__google-workspace__query_gmail_emails(...)` to actually "
+            "fetch the email."
+        )
+        sections.append("")
         if active_lines:
-            sections.append("\nActive (already approved this session — tools callable now):")
+            sections.append("Active (already approved this session — tools callable now):")
             sections.extend(active_lines)
         if available_lines:
             sections.append("\nAvailable (installed but not yet activated):")
@@ -847,6 +902,160 @@ class AgentManager:
         if not lines:
             return ""
         return "<prior_conversation>\n" + "\n".join(lines) + "\n</prior_conversation>"
+
+    # ------------------------------------------------------------------
+    # Compaction & token guard (Phase 2)
+    #
+    # Triggered by *live* context-usage ratio, not turn count. The signal
+    # is the same `ctx_used_pct` we already broadcast to the UI on every
+    # turn: input_tokens / context_window. Three escalating thresholds:
+    #   - compact_threshold_pct (default 0.65): summarize stale tool_results
+    #     and old user/assistant pairs before the next query() call
+    #   - context_soft_cap_pct (default 0.90): pre-send hard guard. After
+    #     compaction, if still over, LRU-trim active_outputs/active_mcps
+    #   - >= 1.0 hits the proxy/Anthropic 200K ceiling — friendly card
+    #     surfaces from the catch-all
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _approx_tokens(text: str) -> int:
+        """Conservative chars/4 estimate. Used for the pre-send guard
+        and the compaction trigger when a precise count_tokens isn't
+        cheap (or the route isn't Anthropic). Errs slightly high so we
+        compact a touch earlier than strictly necessary."""
+        return max(1, len(text or "") // 4)
+
+    @staticmethod
+    def _summarize_message_block(messages: list) -> str:
+        """Programmatic, no-LLM summary of a message slice. Mirrors the
+        shape of browser_agent._summarize_messages: extracts the original
+        user task, counts tool calls, captures the last assistant text.
+        Cheap, deterministic, and never makes a network call — so
+        compaction itself adds zero latency to the user's turn.
+        """
+        if not messages:
+            return ""
+
+        initial_task = ""
+        for m in messages:
+            if getattr(m, "role", "") == "user":
+                content = getattr(m, "content", "")
+                txt = content if isinstance(content, str) else str(content)
+                if txt.strip():
+                    initial_task = txt.strip()[:400]
+                    break
+
+        tool_calls_by_name: dict[str, int] = {}
+        last_tool_results = 0
+        last_assistant_text = ""
+        for m in messages:
+            role = getattr(m, "role", "")
+            if role == "tool_call":
+                content = getattr(m, "content", {}) or {}
+                name = (content.get("tool") if isinstance(content, dict) else None) or "unknown"
+                tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + 1
+            elif role == "tool_result":
+                last_tool_results += 1
+            elif role == "assistant":
+                content = getattr(m, "content", "")
+                if isinstance(content, str) and content.strip():
+                    last_assistant_text = content.strip()
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            txt = (block.get("text") or "").strip()
+                            if txt:
+                                last_assistant_text = txt
+
+        parts = ["<compacted_history>"]
+        parts.append("[The following is a programmatic summary of earlier turns in this session. Originals are preserved on disk and viewable via the chat UI's compaction drawer.]")
+        if initial_task:
+            parts.append(f'Initial user request: "{initial_task}"')
+        if tool_calls_by_name:
+            total = sum(tool_calls_by_name.values())
+            top = sorted(tool_calls_by_name.items(), key=lambda kv: -kv[1])[:8]
+            parts.append(f"Tool calls so far ({total} total): " + ", ".join(f"{n}×{c}" for n, c in top))
+        if last_tool_results:
+            parts.append(f"Tool results received: {last_tool_results}")
+        if last_assistant_text:
+            parts.append("Last assistant message:")
+            parts.append(last_assistant_text[:1200])
+        parts.append("</compacted_history>")
+        return "\n".join(parts)
+
+    def _maybe_compact(self, session: AgentSession, force: bool = False) -> bool:
+        """Run summarizer when ctx_used_pct >= compact_threshold_pct (or force).
+
+        Returns True if a new summary was produced. Mutates session state:
+        sets compacted_through_msg_id and emits a context_status event.
+        Never modifies session.messages — originals stay around for the
+        UI drawer; only the history *sent to the SDK* is trimmed (handled
+        in _build_history_prefix lookups).
+        """
+        ctx_used = session.tokens.get("input", 0) / max(1, session.context_window)
+        if not force and ctx_used < session.compact_threshold_pct:
+            return False
+        msgs = self._get_branch_messages(session)
+        if len(msgs) < 4:
+            return False
+        # Summarize everything up to (but not including) the last 6
+        # messages — that window keeps recent intent visible to the
+        # model so it doesn't lose its train of thought right after
+        # compaction.
+        cutoff = max(0, len(msgs) - 6)
+        if cutoff == 0:
+            return False
+        last_id = msgs[cutoff - 1].id
+        if session.compacted_through_msg_id == last_id and not force:
+            return False
+        session.compacted_through_msg_id = last_id
+        try:
+            _analytics("compaction.run", {
+                "ctx_used_pct": round(ctx_used, 4),
+                "messages_compacted": cutoff,
+                "forced": force,
+            }, session_id=session.id, dashboard_id=session.dashboard_id)
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _truncate_large_tool_result(content: object, session_id: str, msg_id: str, max_bytes: int = 50_000) -> tuple[object, str | None]:
+        """Spill a large tool_result body to disk, return a truncated
+        inline replacement plus the on-disk path (or None if untouched).
+
+        Storage is session-scoped under data/sessions/<session_id>/blobs/
+        — never honors caller-supplied paths (defense against path
+        traversal). The inline replacement keeps the first 4KB so the
+        model retains some signal about what was returned.
+        """
+        if not isinstance(content, str):
+            try:
+                serialized = json.dumps(content) if not isinstance(content, str) else content
+            except Exception:
+                serialized = str(content)
+        else:
+            serialized = content
+        if len(serialized.encode("utf-8")) <= max_bytes:
+            return content, None
+        blobs_dir = os.path.join(SESSIONS_DIR, session_id, "blobs")
+        os.makedirs(blobs_dir, exist_ok=True)
+        # Sanitize msg_id (it's UUID hex, but be defensive).
+        safe_msg_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(msg_id))[:64] or "blob"
+        blob_path = os.path.join(blobs_dir, f"{safe_msg_id}.txt")
+        try:
+            with open(blob_path, "w", encoding="utf-8") as f:
+                f.write(serialized)
+        except Exception as e:
+            logger.warning(f"Failed to spill tool result to {blob_path}: {e}")
+            return content, None
+        head = serialized[:4_000]
+        replacement = (
+            f"{head}\n\n"
+            f"[truncated — full output ({len(serialized)} chars) saved to {blob_path}. "
+            f"Ask the user or run a follow-up tool call if you need the rest.]"
+        )
+        return replacement, blob_path
 
     def _build_prompt_content(self, prompt: str, images: list | None = None, context_paths: list | None = None, forced_tools: list[str] | None = None, attached_skills: list | None = None):
         """Build message content with optional image blocks, context, and forced tools for the Claude API."""
@@ -1142,6 +1351,21 @@ class AgentManager:
 
                 sub_session_id = uuid4().hex
                 sub_name = agent_prompt[:50] if agent_prompt else "Sub-agent"
+                # Subagent context isolation invariant (Phase 3, Layer P):
+                # children DO NOT inherit the parent's active_mcps,
+                # active_outputs, or compaction state. They start with the
+                # AgentSession defaults (empty lists). Reasoning:
+                #   - Security: a parent that activated Gmail shouldn't
+                #     leak Gmail tools to a subagent doing an unrelated
+                #     task. The user only approved Gmail for the parent.
+                #   - Token cost: subagents typically have a narrow task,
+                #     they don't need the parent's full activated set.
+                #   - Failure isolation: if the parent compacted history,
+                #     the subagent shouldn't inherit a summary it can't
+                #     re-expand.
+                # If a subagent ever needs a parent activation, the user
+                # must approve it explicitly via MCPActivate inside the
+                # subagent session — same gate as a fresh top-level chat.
                 sub_session = AgentSession(
                     id=sub_session_id,
                     name=sub_name,
@@ -1158,6 +1382,11 @@ class AgentManager:
                     ],
                     dashboard_id=session.dashboard_id,
                     parent_session_id=session_id,
+                    # Explicit empty lists (matches the model defaults) so
+                    # the invariant is visible at the spawn site rather
+                    # than relying on the field's default_factory.
+                    active_mcps=[],
+                    active_outputs=[],
                 )
                 self.sessions[sub_session_id] = sub_session
                 await ws_manager.broadcast_global("agent:status", {
@@ -1168,6 +1397,21 @@ class AgentManager:
                 result_payload["sub_session_id"] = sub_session_id
 
             result_msg = Message(role="tool_result", content=result_payload, branch_id=session.active_branch_id)
+            # Spill oversized tool results to per-session disk storage.
+            # The replacement keeps the first 4KB inline so the model
+            # retains some signal; the rest lives on disk for the UI to
+            # surface in the compaction drawer. Crucially this happens
+            # at *write* time (before the next turn ships history to the
+            # SDK) so the bloat never re-enters context.
+            try:
+                truncated_content, blob_path = self._truncate_large_tool_result(
+                    result_msg.content, session.id, result_msg.id
+                )
+                if blob_path:
+                    result_msg.content = truncated_content
+                    logger.info(f"Spilled tool result {result_msg.id} ({len(blob_path)} chars) to {blob_path}")
+            except Exception:
+                logger.exception("Tool result truncation failed; keeping inline body")
             session.messages.append(result_msg)
             await ws_manager.send_to_session(session_id, "agent:message", {
                 "session_id": session_id,
@@ -1193,8 +1437,33 @@ class AgentManager:
             #   tool-call layer instead — prompt rules are not a security
             #   boundary.
             connected_tools_ctx = None
-            outputs_ctx = self._build_outputs_context()
+            outputs_ctx = self._build_outputs_context(session.active_outputs)
             browser_ctx = self._build_browser_context(session.dashboard_id, selected_browser_ids=selected_browser_ids)
+
+            # Reconcile active_mcps against currently-enabled tools (Phase 3).
+            # If the user toggled a server off in the Tools page mid-session,
+            # drop it from active_mcps automatically so the model isn't told
+            # "X is active" while _build_mcp_servers silently filters it out.
+            # Emit a context_status event so the model and UI both know.
+            try:
+                _enabled = {
+                    _sanitize_server_name(t.name)
+                    for t in load_all_tools()
+                    if t.mcp_config and t.enabled and t.auth_status in ("configured", "connected")
+                }
+                _stale = [s for s in session.active_mcps if s not in _enabled]
+                if _stale:
+                    session.active_mcps = [s for s in session.active_mcps if s in _enabled]
+                    session.needs_fork = True
+                    await ws_manager.send_to_session(session_id, "agent:context_status", {
+                        "session_id": session_id,
+                        "reason": "mcp_disabled_externally",
+                        "deactivated": _stale,
+                    })
+                    logger.info(f"Reconciled stale active_mcps for session {session_id}: dropped {_stale}")
+            except Exception:
+                logger.exception("active_mcps reconciliation failed; proceeding")
+
             mcp_registry_ctx = self._build_mcp_registry_summary(session.allowed_tools, session.active_mcps)
             global_settings = load_settings()
             composed_prompt = self._compose_system_prompt(
@@ -1282,6 +1551,25 @@ class AgentManager:
             mcp_servers["openswarm-mcp-meta"] = {
                 "command": sys.executable,
                 "args": [mcp_meta_server_path],
+                "env": {
+                    "OPENSWARM_PORT": os.environ.get("OPENSWARM_PORT", "8324"),
+                    "OPENSWARM_AUTH_TOKEN": _get_auth_token3(),
+                    "OPENSWARM_PARENT_SESSION_ID": session.id,
+                },
+                "type": "stdio",
+            }
+
+            # Outputs/Views activation gate (Phase 2). Same shape as the
+            # MCP meta-server but for Outputs. The model only sees a
+            # one-line index of available Outputs in the system prompt
+            # (see _build_outputs_context); to load any specific
+            # Output's full input_schema, it must call OutputActivate.
+            outputs_meta_server_path = os.path.join(
+                os.path.dirname(__file__), "outputs_meta_server.py"
+            )
+            mcp_servers["openswarm-outputs-meta"] = {
+                "command": sys.executable,
+                "args": [outputs_meta_server_path],
                 "env": {
                     "OPENSWARM_PORT": os.environ.get("OPENSWARM_PORT", "8324"),
                     "OPENSWARM_AUTH_TOKEN": _get_auth_token3(),
@@ -1841,6 +2129,64 @@ class AgentManager:
                     elif isinstance(prompt_content, list):
                         prompt_content.insert(0, {"type": "text", "text": history})
 
+            # Compaction trigger (Phase 2). Driven by live ctx_used ratio
+            # rather than turn count — fires when input_tokens/context_window
+            # crosses session.compact_threshold_pct (default 0.65). Cheap,
+            # programmatic summarization (no aux LLM call) so this adds
+            # zero latency on the user's turn.
+            try:
+                if self._maybe_compact(session):
+                    await ws_manager.send_to_session(session_id, "agent:context_status", {
+                        "session_id": session_id,
+                        "reason": "compacted",
+                        "compacted_through_msg_id": session.compacted_through_msg_id,
+                    })
+            except Exception:
+                logger.exception("compaction failed; proceeding without it")
+
+            # Pre-send hard guard (Phase 2). After compaction, if the
+            # session is still over context_soft_cap_pct of the window,
+            # LRU-trim oldest active_outputs then active_mcps. Stops the
+            # 429 from ever firing on predictable overflow paths.
+            try:
+                # Use the most recent measurement (the prior turn's
+                # input_tokens) as the estimate. Conservative because the
+                # current turn's user prompt + any new history adds on top
+                # — but the first turn of a fresh session has tokens=0 so
+                # we only act once we've seen real numbers.
+                _est_tokens = session.tokens.get("input", 0)
+                _hard_cap = int(session.context_window * session.context_soft_cap_pct)
+                if _est_tokens >= _hard_cap:
+                    trimmed: list[str] = []
+                    while _est_tokens >= _hard_cap and session.active_outputs:
+                        trimmed.append(f"output:{session.active_outputs.pop(0)}")
+                        _est_tokens -= 5_000  # rough per-Output schema cost
+                    while _est_tokens >= _hard_cap and len(session.active_mcps) > 1:
+                        # Keep at least one MCP active so the model can
+                        # finish whatever it was doing; trim from oldest
+                        # which is FIFO order in the list.
+                        trimmed.append(f"mcp:{session.active_mcps.pop(0)}")
+                        _est_tokens -= 8_000  # rough per-MCP schema cost
+                    if trimmed:
+                        await ws_manager.send_to_session(session_id, "agent:context_status", {
+                            "session_id": session_id,
+                            "reason": "trimmed",
+                            "trimmed": trimmed,
+                            "estimate_after": _est_tokens,
+                        })
+                        _analytics("context.overflow_warned", {
+                            "trimmed_count": len(trimmed),
+                            "estimate_before": session.tokens.get("input", 0),
+                            "estimate_after": _est_tokens,
+                        }, session_id=session_id, dashboard_id=session.dashboard_id)
+                        # Trimming changes mcp_servers / outputs context →
+                        # rebuild options. The cheapest correct path is
+                        # to flag for fork on next turn via needs_fork
+                        # and let the existing fork path handle it.
+                        session.needs_fork = True
+            except Exception:
+                logger.exception("pre-send token guard failed; proceeding")
+
             logger.info(f"[MCP-DEBUG] Creating ClaudeAgentOptions short={session.model} resolved={resolved_model} api_type={api_type}")
             options = ClaudeAgentOptions(**options_kwargs)
             logger.info(f"[MCP-DEBUG] ClaudeAgentOptions created. Starting query...")
@@ -2139,6 +2485,29 @@ class AgentManager:
                     raise
 
             session.status = "completed"
+
+            # Auto-continuation hook (Phase 3). If MCPActivate (or any
+            # analogous flow) flagged pending_continuation during this
+            # turn, kick off a follow-up turn immediately with the
+            # captured prompt. We dispatch as a fire-and-forget task so
+            # the current _run_agent_loop frame can unwind cleanly
+            # before the next turn's options + history rebuild kicks in.
+            # The follow-up is `hidden=True` so it doesn't add a user
+            # bubble to the visible chat; the model sees it as a
+            # synthetic prompt to keep working.
+            try:
+                if getattr(session, "pending_continuation", False):
+                    _continuation_prompt = session.pending_continuation_prompt or "Continue."
+                    session.pending_continuation = False
+                    session.pending_continuation_prompt = None
+                    asyncio.create_task(self.send_message(
+                        session_id,
+                        _continuation_prompt,
+                        hidden=True,
+                    ))
+                    logger.info(f"Auto-continuing session {session_id} with hidden prompt")
+            except Exception:
+                logger.exception("auto-continuation dispatch failed")
         except asyncio.CancelledError:
             session.status = "stopped"
         except Exception as e:

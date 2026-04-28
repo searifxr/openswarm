@@ -1,8 +1,16 @@
-anthropic
-claude-agent-sdk
+# Pinned to specific versions so production builds (DMG/EXE/pkg) are
+# reproducible — same CLI version baked into every artifact regardless
+# of when the build runs. Bump these deliberately after dogfooding the
+# new behavior in dev.
+#   anthropic 0.97.0   — current latest as of 2026-04-28
+#   claude-agent-sdk 0.1.70 — bundles Claude Code CLI 2.1.122 (above
+#     the 2.1.90 deferred-tools cache-fix floor)
+#   pydantic 2.13.3    — required floor for mcp >=1.27
+anthropic==0.97.0
+claude-agent-sdk==0.1.70
 jsonschema
 fastapi[standard]
-pydantic==2.10.5
+pydantic==2.13.3
 langchain-core==0.3.51
 langchain-openai==0.3.12
 typeguard==4.4.2

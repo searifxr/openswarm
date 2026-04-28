@@ -31,7 +31,35 @@ import CommandPicker, { CommandPickerItem, getToolGroupIcon } from '@/app/compon
 import { useElementSelection, SelectedElement } from '@/app/components/ElementSelectionContext';
 import { getClipboardCards, clearClipboard } from '@/shared/dashboardClipboard';
 import { getWebview } from '@/shared/browserRegistry';
-import { API_BASE } from '@/shared/config';
+import { API_BASE, getAuthToken } from '@/shared/config';
+
+// Slash command parser (Phase 2). Returns true if the command was handled
+// and the prompt should NOT be sent to the agent. Three commands:
+//   /context — toggle a drawer (purely UI, dispatched via window event)
+//   /compact — POST /sessions/{id}/compact, force compaction now
+//   /clear   — POST /sessions/{id}/clear, reset SDK session id (UI history kept)
+async function handleSlashCommand(cmd: string, sessionId: string): Promise<boolean> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const tok = (() => { try { return getAuthToken(); } catch { return ''; } })();
+  if (tok) headers['Authorization'] = `Bearer ${tok}`;
+  if (cmd === '/context') {
+    window.dispatchEvent(new CustomEvent('openswarm:context-drawer', { detail: { sessionId, open: true } }));
+    return true;
+  }
+  if (cmd === '/compact') {
+    try {
+      await fetch(`${API_BASE}/api/agents/sessions/${sessionId}/compact`, { method: 'POST', headers });
+    } catch { /* errors flow through context_status WS event */ }
+    return true;
+  }
+  if (cmd === '/clear') {
+    try {
+      await fetch(`${API_BASE}/api/agents/sessions/${sessionId}/clear`, { method: 'POST', headers });
+    } catch { /* same */ }
+    return true;
+  }
+  return false;
+}
 import { ContextPath } from '@/app/components/DirectoryBrowser';
 import {
   SKILL_PILL_ATTR,
@@ -364,6 +392,21 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     const serialized = serializeEditorContent(editor, attachedSkillsRef.current);
     let trimmed = serialized.trim();
     if (!trimmed) return;
+
+    // Slash commands (Phase 2). Parsed client-side so we don't pollute
+    // the agent loop with meta-actions; calls the corresponding backend
+    // endpoint and clears the input. /context is pure-frontend (toggle
+    // a drawer); /compact and /clear hit session endpoints.
+    if (sessionId && trimmed.startsWith('/')) {
+      const cmd = trimmed.split(/\s+/)[0].toLowerCase();
+      const handled = await handleSlashCommand(cmd, sessionId);
+      if (handled) {
+        editor.innerHTML = '';
+        _draftStore.delete(ownerId);
+        setHasContent(false);
+        return;
+      }
+    }
 
     const selectedEls = elementSelection?.elementsByOwner?.[ownerId] ?? [];
     let allImages = images.length > 0

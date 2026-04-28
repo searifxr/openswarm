@@ -16,6 +16,7 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import CheckIcon from '@mui/icons-material/Check';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
+import { API_BASE, getAuthToken } from '@/shared/config';
 import {
   sendMessage as sendMessageThunk,
   launchAndSendFirstMessage,
@@ -42,6 +43,7 @@ import ToolCallBubble, { ToolPair } from './ToolCallBubble';
 import ToolGroupBubble, { RenderItem, ToolGroup, isToolGroup, isToolPair } from './ToolGroupBubble';
 import ApprovalBar, { BatchApprovalBar } from './ApprovalBar';
 import ChatInput, { ChatInputHandle } from './ChatInput';
+import ContextDrawer from './ContextDrawer';
 import { ErrorSlime } from '@/app/components/ErrorSlime';
 import { ContextPath } from '@/app/components/DirectoryBrowser';
 import DiffViewer from './DiffViewer';
@@ -739,6 +741,7 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
 
   return (
     <Box sx={{ display: 'flex', height: '100%' }}>
+      <ContextDrawer />
       <Box sx={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, overflow: 'hidden' }}>
         {!embedded && (
           <Box
@@ -877,6 +880,72 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
               scrollbarColor: `${c.border.medium} transparent`,
             }}
           >
+            {(session.mcp_suggestions && session.mcp_suggestions.length > 0) && (
+              <Box sx={{
+                mt: 1,
+                mb: 1.5,
+                p: 1.5,
+                borderRadius: 1.5,
+                border: `1px solid ${c.border.medium}`,
+                bgcolor: c.bg.secondary,
+              }}>
+                <Typography variant="body2" sx={{ color: c.text.primary, fontWeight: 500, mb: 0.5 }}>
+                  Looks like this might need an integration
+                </Typography>
+                <Typography variant="caption" sx={{ color: c.text.secondary, display: 'block', mb: 1 }}>
+                  Activating one of these will let the agent answer in a single round-trip.
+                </Typography>
+                <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1 }}>
+                  {session.mcp_suggestions.map((s) => (
+                    <Box key={s.id} sx={{ flexBasis: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
+                      <Box sx={{ flex: 1, minWidth: 0 }}>
+                        <Typography variant="caption" sx={{ color: c.text.primary, fontWeight: 500 }}>
+                          {s.title}
+                        </Typography>
+                        {s.reason && (
+                          <Typography variant="caption" sx={{ display: 'block', color: c.text.tertiary }}>
+                            {s.reason}
+                          </Typography>
+                        )}
+                      </Box>
+                      <Typography
+                        component="button"
+                        variant="caption"
+                        onClick={async () => {
+                          try {
+                            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                            const tok = (() => { try { return getAuthToken(); } catch { return ''; } })();
+                            if (tok) headers['Authorization'] = `Bearer ${tok}`;
+                            await fetch(`${API_BASE}/api/mcp-meta/activate`, {
+                              method: 'POST',
+                              headers,
+                              body: JSON.stringify({
+                                server_name: s.id.toLowerCase().replace(/\s+/g, '-'),
+                                reason: s.reason || 'preflight suggestion',
+                                parent_session_id: session.id,
+                              }),
+                            });
+                          } catch { /* ignore */ }
+                        }}
+                        sx={{
+                          cursor: 'pointer',
+                          border: `1px solid ${c.border.medium}`,
+                          borderRadius: 1,
+                          px: 1.25,
+                          py: 0.5,
+                          bgcolor: 'transparent',
+                          color: c.text.primary,
+                          '&:hover': { bgcolor: c.bg.elevated },
+                          flexShrink: 0,
+                        }}
+                      >
+                        Activate
+                      </Typography>
+                    </Box>
+                  ))}
+                </Box>
+              </Box>
+            )}
             {session.context_overflow && (() => {
               const reason = session.context_overflow.reason;
               const isAuth = reason === 'openswarm_pro_auth_expired' || reason === 'anthropic_auth_invalid' || reason === 'auth_error';

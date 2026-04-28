@@ -487,7 +487,195 @@ async def mcp_meta(action: str, request: Request):
             }, session_id=parent_session_id, dashboard_id=session.dashboard_id)
         except Exception:
             pass
-        return JSONResponse({"status": "activated", "server_name": server_name})
+
+        # Auto-continue: flag the session so that after its current turn
+        # ends (which is the turn that contains this MCPActivate tool
+        # call), the agent loop dispatches a synthetic "continue" turn
+        # with the freshly-activated tools available. Race-free — read
+        # at the natural turn-boundary inside _run_agent_loop instead of
+        # racing a background task against the turn's completion path.
+        # Turns the typical 3-prompt flow ("check email" → MCPActivate
+        # → "do it") into a 1-prompt flow.
+        session.pending_continuation = True
+        session.pending_continuation_prompt = (
+            "[mcp:auto-continue] The MCP server you requested has been "
+            f"activated (`{server_name}`). Continue with the user's original "
+            "request now using the newly-available tools — do NOT ask "
+            "for confirmation."
+        )
+
+        return JSONResponse({"status": "activated", "server_name": server_name, "auto_continue": True})
+
+    return JSONResponse({"error": f"unknown action: {action}"}, status_code=400)
+
+
+@app.post("/api/agents/sessions/{session_id}/compact")
+async def session_compact(session_id: str):
+    """Force a compaction pass on a session (Phase 2 /compact slash cmd).
+
+    Cheap programmatic summarization (no aux LLM call), so it's safe to
+    invoke at any time. Sets needs_fork=True so the next turn rebuilds
+    options and ships the compacted prefix.
+    """
+    from backend.apps.agents.agent_manager import agent_manager
+    from backend.apps.agents.ws_manager import ws_manager as _ws
+    session = agent_manager.sessions.get(session_id)
+    if not session:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    did_compact = agent_manager._maybe_compact(session, force=True)
+    session.needs_fork = True
+    await _ws.send_to_session(session_id, "agent:context_status", {
+        "session_id": session_id,
+        "reason": "compacted_manual" if did_compact else "noop",
+        "compacted_through_msg_id": session.compacted_through_msg_id,
+    })
+    return JSONResponse({"compacted": did_compact, "compacted_through_msg_id": session.compacted_through_msg_id})
+
+
+@app.post("/api/agents/sessions/{session_id}/clear")
+async def session_clear(session_id: str):
+    """Reset a session to a fresh sdk_session_id (Phase 2 /clear slash cmd).
+
+    Preserves session.messages (so the chat UI keeps the visible history)
+    but clears the SDK-side conversation by minting a new sdk_session_id.
+    Also drops active_mcps/active_outputs so the user starts fresh.
+    """
+    from backend.apps.agents.agent_manager import agent_manager
+    from backend.apps.agents.ws_manager import ws_manager as _ws
+    session = agent_manager.sessions.get(session_id)
+    if not session:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+    session.sdk_session_id = None
+    session.active_mcps = []
+    session.active_outputs = []
+    session.compacted_through_msg_id = None
+    session.tokens = {"input": 0, "output": 0}
+    session.cost_usd = 0.0
+    session.needs_fork = False
+    await _ws.send_to_session(session_id, "agent:status", {
+        "session_id": session_id,
+        "status": session.status,
+        "session": session.model_dump(mode="json"),
+    })
+    await _ws.send_to_session(session_id, "agent:context_status", {
+        "session_id": session_id,
+        "reason": "cleared",
+    })
+    return JSONResponse({"cleared": True})
+
+
+@app.post("/api/outputs-meta/{action}")
+async def outputs_meta(action: str, request: Request):
+    """Back the openswarm-outputs-meta stdio MCP server.
+
+    Mirrors mcp_meta but for Outputs/Views: list/search/activate against
+    the canonical Output store. Anti-hallucination: unknown ids return
+    the valid options instead of activating. Schema spilled into context
+    on next turn via session.active_outputs (consumed by
+    _build_outputs_context in agent_manager).
+    """
+    from datetime import datetime as _dt
+    from backend.apps.agents.agent_manager import agent_manager
+    from backend.apps.outputs.outputs import _load_all as load_all_outputs, _save as save_output
+
+    body = await request.json()
+    parent_session_id = body.get("parent_session_id", "")
+
+    def _all_outputs_ranked() -> list[dict]:
+        items = []
+        for o in load_all_outputs():
+            items.append({
+                "id": o.id,
+                "name": o.name,
+                "description": (o.description or "").strip(),
+                "use_count": int(getattr(o, "use_count", 0) or 0),
+                "last_used_at": getattr(o, "last_used_at", None),
+            })
+        # Sort: most-used first, then most-recent, then alphabetical.
+        items.sort(key=lambda i: (-(i["use_count"] or 0), -(len(i["last_used_at"] or "")), i["name"].lower()))
+        return items
+
+    if action == "list":
+        outputs = _all_outputs_ranked()
+        session = agent_manager.sessions.get(parent_session_id) if parent_session_id else None
+        active_set = set(session.active_outputs) if session else set()
+        active = [{**o, "status": "active"} for o in outputs if o["id"] in active_set]
+        available = [{**o, "status": "available"} for o in outputs if o["id"] not in active_set]
+        return JSONResponse({"active": active, "available": available})
+
+    if action == "search":
+        query = (body.get("query") or "").strip().lower()
+        if not query:
+            return JSONResponse({"matches": []})
+        outputs = _all_outputs_ranked()
+        session = agent_manager.sessions.get(parent_session_id) if parent_session_id else None
+        active_set = set(session.active_outputs) if session else set()
+        scored: list[tuple[int, dict]] = []
+        for o in outputs:
+            hay = f"{o['name']} {o['description']}".lower()
+            score = 0
+            for tok in query.split():
+                if tok and tok in hay:
+                    score += 2 if tok in o["name"].lower() else 1
+            # Use-count bonus so frequently-rendered Outputs surface for
+            # generic queries like "dashboard" / "chart".
+            if score:
+                score += min(3, (o["use_count"] or 0) // 5)
+                annotated = {**o, "status": "active" if o["id"] in active_set else "available"}
+                scored.append((score, annotated))
+        scored.sort(key=lambda t: (-t[0], 0 if t[1]["status"] == "active" else 1, t[1]["name"]))
+        matches = [s for _, s in scored[:5]]
+        return JSONResponse({"matches": matches})
+
+    if action == "activate":
+        output_id = (body.get("output_id") or "").strip()
+        reason = body.get("reason") or ""
+        if not output_id:
+            return JSONResponse({"error": "output_id is required"}, status_code=400)
+        if not parent_session_id:
+            return JSONResponse({"error": "parent_session_id is required"}, status_code=400)
+        session = agent_manager.sessions.get(parent_session_id)
+        if not session:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+
+        all_outputs = load_all_outputs()
+        match = next((o for o in all_outputs if o.id == output_id), None)
+        if not match:
+            return JSONResponse({"status": "unknown_output", "available": [o.id for o in all_outputs]})
+
+        if output_id in session.active_outputs:
+            return JSONResponse({"status": "already_active", "output_id": output_id})
+
+        session.active_outputs.append(output_id)
+        session.needs_fork = True
+        # Bump usage stats. Activation is a pretty strong "model intends
+        # to use this" signal — even if RenderOutput isn't called, the
+        # Output is meaningfully in scope. last_used_at lets ranking
+        # surface "stuff I touched recently" to the model later.
+        try:
+            match.use_count = int(getattr(match, "use_count", 0) or 0) + 1
+            match.last_used_at = _dt.now().isoformat()
+            save_output(match)
+        except Exception:
+            logger.exception("Failed to bump Output usage stats")
+        try:
+            from backend.apps.agents.ws_manager import ws_manager as _ws
+            await _ws.send_to_session(parent_session_id, "agent:status", {
+                "session_id": parent_session_id,
+                "status": session.status,
+                "session": session.model_dump(mode="json"),
+            })
+        except Exception:
+            logger.exception("Failed to broadcast post-activate session status")
+        try:
+            from backend.apps.analytics.collector import record as _analytics
+            _analytics("output.activated", {
+                "output_id": output_id,
+                "reason_len": len(reason),
+            }, session_id=parent_session_id, dashboard_id=session.dashboard_id)
+        except Exception:
+            pass
+        return JSONResponse({"status": "activated", "output_id": output_id})
 
     return JSONResponse({"error": f"unknown action: {action}"}, status_code=400)
 

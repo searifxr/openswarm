@@ -79,6 +79,10 @@ export interface AgentSession {
   cache_read_pct?: number;
   cache_read_tokens?: number;
   context_overflow?: { reason: string; message: string; at: string } | null;
+  mcp_suggestions?: Array<{ id: string; title: string; description: string; reason?: string }>;
+  mcp_suggestions_is_vague?: boolean;
+  active_outputs?: string[];
+  compacted_through_msg_id?: string | null;
 }
 
 export interface AgentConfig {
@@ -741,6 +745,31 @@ const agentsSlice = createSlice({
       }
     },
 
+    setMcpSuggestions(
+      state,
+      action: PayloadAction<{
+        sessionId: string;
+        suggestions: Array<{ id: string; title: string; description: string; reason?: string }>;
+        isVague: boolean;
+      }>
+    ) {
+      const session = state.sessions[action.payload.sessionId];
+      if (session) {
+        session.mcp_suggestions = action.payload.suggestions;
+        session.mcp_suggestions_is_vague = action.payload.isVague;
+      }
+    },
+
+    clearMcpSuggestions(
+      state,
+      action: PayloadAction<{ sessionId: string }>
+    ) {
+      const session = state.sessions[action.payload.sessionId];
+      if (session) {
+        session.mcp_suggestions = [];
+      }
+    },
+
     addBranch(state, action: PayloadAction<{ sessionId: string; branch: MessageBranch }>) {
       const session = state.sessions[action.payload.sessionId];
       if (session) {
@@ -1110,6 +1139,8 @@ export const {
   updateSessionContext,
   setContextOverflow,
   clearContextOverflow,
+  setMcpSuggestions,
+  clearMcpSuggestions,
   addBranch,
   setActiveBranch,
   updateSessionProvider,
