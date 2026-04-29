@@ -188,6 +188,18 @@ class AnthropicProvider(BaseProvider):
                         tool_name=block.name,
                         tool_id=block.id,
                     )
+                elif block_type == "thinking":
+                    # Extended-thinking content block. We track the
+                    # accumulated text in current_text just like a normal
+                    # text block, but tag it as "thinking" so the agent
+                    # loop emits a distinct WS event the frontend can
+                    # render in the ThinkingBubble pill.
+                    current_text[index] = ""
+                    yield StreamEvent(
+                        type="content_block_start",
+                        index=index,
+                        block_type="thinking",
+                    )
 
             elif event_type == "content_block_delta":
                 index = event.index
@@ -212,6 +224,24 @@ class AnthropicProvider(BaseProvider):
                         delta_type="input_json_delta",
                         text=delta.partial_json,
                     )
+                elif delta_type == "thinking_delta":
+                    # Extended-thinking text streamed as it's produced.
+                    # Forward as a thinking_delta so the agent loop can
+                    # ship it to the frontend without conflating with
+                    # the assistant text stream.
+                    text_chunk = getattr(delta, "thinking", "") or ""
+                    current_text.setdefault(index, "")
+                    current_text[index] += text_chunk
+                    yield StreamEvent(
+                        type="content_block_delta",
+                        index=index,
+                        delta_type="thinking_delta",
+                        text=text_chunk,
+                    )
+                # Note: signature_delta (the cryptographic signature on
+                # thinking blocks) is intentionally ignored — we don't
+                # display it and it isn't needed for replay since we
+                # never re-send thinking blocks to the model.
 
             elif event_type == "content_block_stop":
                 yield StreamEvent(type="content_block_stop", index=event.index)

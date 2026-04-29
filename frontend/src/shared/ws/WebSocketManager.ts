@@ -20,9 +20,11 @@ import {
   trackAgentNotification,
   setSessionConnState,
   fetchSession,
+  recordCompaction,
 } from '../state/agentsSlice';
 import { addBrowserCardFromBackend, removeBrowserCard, setBrowserCardPosition, setGlowingBrowserCards, GRID_GAP } from '../state/dashboardLayoutSlice';
 import { getAuthToken } from '../config';
+import { notifyAgentCompletion } from '../notifications';
 
 // Thin wrapper around getAuthToken so the connect() call site stays
 // synchronous. If the token isn't cached yet, returns '' and the WS
@@ -405,13 +407,50 @@ class WebSocketManager {
 
     switch (event) {
       case 'agent:status':
-        if (data.session) {
-          store.dispatch(updateSession(data.session));
-        } else if (session_id) {
-          store.dispatch(updateSessionStatus({ sessionId: session_id, status: data.status }));
-        }
-        if (data.status === 'running' && session_id) {
-          store.dispatch(trackAgentNotification(session_id));
+        // Capture pre-transition status so we only fire a system notification
+        // on a real running→terminal transition. Otherwise a session that
+        // was already 'completed' on disk and got refetched would re-toast.
+        {
+          const prevSession = session_id ? store.getState().agents.sessions[session_id] : undefined;
+          const prevStatus = prevSession?.status;
+
+          if (data.session) {
+            store.dispatch(updateSession(data.session));
+          } else if (session_id) {
+            store.dispatch(updateSessionStatus({ sessionId: session_id, status: data.status }));
+          }
+          if (data.status === 'running' && session_id) {
+            store.dispatch(trackAgentNotification(session_id));
+          }
+
+          // Fire a native notification when an agent terminates while the
+          // window is hidden. Skips sub-agents and browser-agents (the
+          // parent's own completion is what the user cares about) and only
+          // fires on a real transition from a non-terminal state.
+          const TERMINAL = new Set(['completed', 'error']);
+          const NON_TERMINAL = new Set(['running', 'waiting_approval', undefined, null, '']);
+          if (
+            session_id &&
+            TERMINAL.has(data.status) &&
+            NON_TERMINAL.has(prevStatus as any) &&
+            data.session?.mode !== 'browser-agent' &&
+            data.session?.mode !== 'sub-agent' &&
+            data.session?.mode !== 'invoked-agent'
+          ) {
+            const sess = data.session ?? prevSession;
+            if (sess) {
+              const lastAssistant = [...(sess.messages || [])]
+                .reverse()
+                .find((m: any) => m.role === 'assistant' && typeof m.content === 'string');
+              notifyAgentCompletion({
+                sessionId: session_id,
+                sessionName: sess.name || 'Agent',
+                dashboardId: sess.dashboard_id,
+                status: data.status as 'completed' | 'error',
+                bodyExcerpt: lastAssistant ? String(lastAssistant.content) : undefined,
+              });
+            }
+          }
         }
         // Per-sub-agent close via browser_id; skip user-created cards (no spawned_by).
         if (
@@ -506,6 +545,20 @@ class WebSocketManager {
             sessionId: session_id,
             reason: data.reason ?? 'long_context_required',
             message: data.message ?? 'Context full.',
+          }));
+        }
+        break;
+
+      case 'agent:context_status':
+        // Auto-compaction collapsed older turns into a summary. Mirror
+        // compacted_through_msg_id locally so the renderer can drop a
+        // visible "N earlier turns summarized" chip into the transcript.
+        // Other reasons (cleared, etc.) flow through this same event but
+        // don't currently need a chip — ignore them for now.
+        if (session_id && data.reason === 'compacted') {
+          store.dispatch(recordCompaction({
+            sessionId: session_id,
+            throughMsgId: data.compacted_through_msg_id ?? null,
           }));
         }
         break;

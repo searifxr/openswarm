@@ -15,6 +15,15 @@ export interface AgentMessage {
   forced_tools?: string[];
   images?: Array<{ data: string; media_type: string }>;
   hidden?: boolean;
+  // Client-generated id used for optimistic-bubble dedupe. Set on the
+  // optimistic message we synthesize in `sendMessage.pending` and on the
+  // server echo (round-tripped via the POST body); the addMessage reducer
+  // uses it to find and replace the optimistic placeholder.
+  client_message_id?: string;
+  // Frontend-only lifecycle marker for optimistic messages. 'pending' until
+  // the server echo lands; 'failed' if the POST rejected. Confirmed messages
+  // (i.e. ones echoed back from the server) drop this field entirely.
+  optimistic_status?: 'pending' | 'failed';
 }
 
 export interface ApprovalRequest {
@@ -179,15 +188,41 @@ export interface SendMessagePayload {
   selectedBrowserIds?: string[];
 }
 
+function _genOptimisticId(): string {
+  return `opt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export const sendMessage = createAsyncThunk(
   'agents/sendMessage',
-  async ({ sessionId, prompt, mode, model, provider, images, contextPaths, forcedTools, attachedSkills, hidden, selectedBrowserIds }: SendMessagePayload) => {
-    await fetch(`${AGENTS_API}/sessions/${sessionId}/message`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, mode, model, provider, images, context_paths: contextPaths, forced_tools: forcedTools, attached_skills: attachedSkills, hidden, selected_browser_ids: selectedBrowserIds }),
-    });
-    return { sessionId, prompt };
+  async ({ sessionId, prompt, mode, model, provider, images, contextPaths, forcedTools, attachedSkills, hidden, selectedBrowserIds }: SendMessagePayload, { dispatch }) => {
+    // Generate an optimistic id up-front and dispatch the synchronous
+    // bubble *before* awaiting the network. The reducer below
+    // (sendMessage.pending) handles the same path, but doing it here
+    // gives us access to the id we'll round-trip to the server for
+    // dedupe on echo.
+    const clientMessageId = _genOptimisticId();
+    dispatch(addOptimisticMessage({
+      sessionId,
+      clientMessageId,
+      prompt,
+      contextPaths,
+      forcedTools,
+      attachedSkills: attachedSkills?.map((s) => ({ id: s.id, name: s.name })),
+      images: images?.map((img) => ({ data: img.data, media_type: img.media_type })),
+      hidden: hidden ?? false,
+    }));
+    try {
+      const res = await fetch(`${AGENTS_API}/sessions/${sessionId}/message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, mode, model, provider, images, context_paths: contextPaths, forced_tools: forcedTools, attached_skills: attachedSkills, hidden, selected_browser_ids: selectedBrowserIds, client_message_id: clientMessageId }),
+      });
+      if (!res.ok) throw new Error(`send failed: ${res.status}`);
+    } catch (err) {
+      dispatch(markOptimisticFailed({ sessionId, clientMessageId }));
+      throw err;
+    }
+    return { sessionId, prompt, clientMessageId };
   }
 );
 
@@ -630,17 +665,97 @@ const agentsSlice = createSlice({
 
     addMessage(state, action: PayloadAction<{ sessionId: string; message: AgentMessage }>) {
       const session = state.sessions[action.payload.sessionId];
-      if (session) {
-        const idx = session.messages.findIndex((m) => m.id === action.payload.message.id);
-        if (idx >= 0) {
-          session.messages[idx] = action.payload.message;
-        } else {
-          session.messages.push(action.payload.message);
-        }
-        if (session.streamingMessage?.id === action.payload.message.id) {
-          session.streamingMessage = null;
+      if (!session) return;
+      const incoming = action.payload.message;
+      // Optimistic-bubble dedupe: if this echo carries a client_message_id
+      // and we have an optimistic placeholder with the same id, replace it
+      // with the server version (preserving server's id, dropping the
+      // optimistic_status marker so the bubble renders as confirmed).
+      if (incoming.client_message_id) {
+        const optIdx = session.messages.findIndex(
+          (m) => m.client_message_id === incoming.client_message_id && m.optimistic_status === 'pending',
+        );
+        if (optIdx >= 0) {
+          session.messages[optIdx] = { ...incoming, optimistic_status: undefined };
+          if (session.streamingMessage?.id === incoming.id) {
+            session.streamingMessage = null;
+          }
+          return;
         }
       }
+      const idx = session.messages.findIndex((m) => m.id === incoming.id);
+      if (idx >= 0) {
+        session.messages[idx] = incoming;
+      } else {
+        session.messages.push(incoming);
+      }
+      if (session.streamingMessage?.id === incoming.id) {
+        session.streamingMessage = null;
+      }
+    },
+
+    // Synchronous "you sent a message" bubble dispatched from the
+    // sendMessage thunk before the network round-trip. The placeholder
+    // carries a client_message_id which the server echo (agent:message)
+    // will round-trip back; addMessage dedupes against it.
+    addOptimisticMessage(
+      state,
+      action: PayloadAction<{
+        sessionId: string;
+        clientMessageId: string;
+        prompt: string;
+        contextPaths?: Array<{ path: string; type: 'file' | 'directory' }>;
+        forcedTools?: string[];
+        attachedSkills?: Array<{ id: string; name: string }>;
+        images?: Array<{ data: string; media_type: string }>;
+        hidden?: boolean;
+      }>,
+    ) {
+      const { sessionId, clientMessageId, prompt, contextPaths, forcedTools, attachedSkills, images, hidden } = action.payload;
+      const session = state.sessions[sessionId];
+      if (!session) return;
+      // Hidden messages (e.g. continuation prompts the model fires
+      // internally) shouldn't render an optimistic bubble.
+      if (hidden) return;
+      session.messages.push({
+        id: clientMessageId,
+        role: 'user',
+        content: prompt,
+        timestamp: new Date().toISOString(),
+        branch_id: session.active_branch_id,
+        parent_id: null,
+        context_paths: contextPaths,
+        attached_skills: attachedSkills,
+        forced_tools: forcedTools,
+        images,
+        client_message_id: clientMessageId,
+        optimistic_status: 'pending',
+      });
+    },
+
+    markOptimisticFailed(
+      state,
+      action: PayloadAction<{ sessionId: string; clientMessageId: string }>,
+    ) {
+      const session = state.sessions[action.payload.sessionId];
+      if (!session) return;
+      const msg = session.messages.find(
+        (m) => m.client_message_id === action.payload.clientMessageId && m.optimistic_status === 'pending',
+      );
+      if (msg) msg.optimistic_status = 'failed';
+    },
+
+    // Backend emits agent:context_status with reason="compacted" when the
+    // auto-compaction routine collapses older turns into a summary. We
+    // mirror compacted_through_msg_id locally so the renderer can drop a
+    // chip in the transcript right after that message.
+    recordCompaction(
+      state,
+      action: PayloadAction<{ sessionId: string; throughMsgId: string | null }>,
+    ) {
+      const session = state.sessions[action.payload.sessionId];
+      if (!session) return;
+      session.compacted_through_msg_id = action.payload.throughMsgId;
     },
 
     streamStart(
@@ -1166,6 +1281,9 @@ export const {
   updateSessionStatus,
   setSessionConnState,
   addMessage,
+  addOptimisticMessage,
+  markOptimisticFailed,
+  recordCompaction,
   streamStart,
   streamDelta,
   streamEnd,

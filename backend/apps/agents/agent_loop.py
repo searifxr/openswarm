@@ -157,6 +157,23 @@ class AgentLoop:
                         "tool_name": event.tool_name,
                     })
 
+                elif event.block_type == "thinking":
+                    # Extended-thinking content block. Emit a distinct
+                    # WS stream with role="thinking" so the frontend
+                    # renders the live ThinkingBubble pill (rising
+                    # token counter, auto-collapse on first text). Each
+                    # thinking block gets its own message id — multiple
+                    # interleaved thinking/text blocks remain
+                    # individually addressable.
+                    thinking_msg_id = uuid4().hex
+                    block_index_map[event.index] = thinking_msg_id
+                    block_types[event.index] = "thinking"
+                    text_buffers[event.index] = ""
+                    await self.ws_emitter("agent:stream_start", {
+                        "message_id": thinking_msg_id,
+                        "role": "thinking",
+                    })
+
             elif event.type == "content_block_delta":
                 msg_id = block_index_map.get(event.index)
                 if not msg_id:
@@ -173,6 +190,16 @@ class AgentLoop:
                 elif event.delta_type == "input_json_delta":
                     json_buffers.setdefault(event.index, "")
                     json_buffers[event.index] += event.text
+                    await self.ws_emitter("agent:stream_delta", {
+                        "message_id": msg_id,
+                        "delta": event.text,
+                    })
+
+                elif event.delta_type == "thinking_delta":
+                    # Reuse the text buffer for thinking — same shape
+                    # (accumulated str), different sink.
+                    text_buffers.setdefault(event.index, "")
+                    text_buffers[event.index] += event.text
                     await self.ws_emitter("agent:stream_delta", {
                         "message_id": msg_id,
                         "delta": event.text,
@@ -199,9 +226,17 @@ class AgentLoop:
                             input=tool_input,
                         ),
                     ))
+                elif bt == "thinking":
+                    collected_content.append(
+                        ContentBlock(type="thinking", text=text_buffers.get(event.index, ""))
+                    )
 
-                # Send stream_end for tool blocks (text block ends at message_stop)
-                if msg_id and bt == "tool_use":
+                # Send stream_end for tool + thinking blocks (text block
+                # ends at message_stop). Thinking ends here so the
+                # frontend can transition the pill from "live" to
+                # "Thought for Ns" the moment the model stops thinking,
+                # even if it then keeps streaming text.
+                if msg_id and (bt == "tool_use" or bt == "thinking"):
                     await self.ws_emitter("agent:stream_end", {
                         "message_id": msg_id,
                     })
@@ -242,6 +277,21 @@ class AgentLoop:
     ) -> None:
         """Emit finalized agent:message events for the collected response."""
         from backend.apps.agents.models import Message
+
+        # Emit thinking blocks (extended thinking). Persisted as their own
+        # messages so a session reload still shows the reasoning trail.
+        # Multiple thinking blocks per turn are concatenated into a single
+        # persisted message — the streaming UI already showed each block
+        # individually, this is just for the historical record.
+        thinking_parts = [b.text for b in content if b.type == "thinking" and b.text]
+        if thinking_parts:
+            msg = Message(
+                role="thinking",
+                content="\n\n".join(thinking_parts),
+            )
+            await self.ws_emitter("agent:message", {
+                "message": msg.model_dump(mode="json"),
+            })
 
         # Emit text message
         text_parts = [b.text for b in content if b.type == "text" and b.text]

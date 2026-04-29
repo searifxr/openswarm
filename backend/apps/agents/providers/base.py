@@ -31,7 +31,7 @@ class ToolCall:
 @dataclass
 class ContentBlock:
     """A block of content from the model response."""
-    type: str  # "text" | "tool_use"
+    type: str  # "text" | "tool_use" | "thinking"
     text: str = ""
     tool_call: ToolCall | None = None
 
@@ -53,8 +53,8 @@ class StreamEvent:
     """
     type: str
     index: int = 0
-    block_type: str = ""    # "text" | "tool_use"
-    delta_type: str = ""    # "text_delta" | "input_json_delta"
+    block_type: str = ""    # "text" | "tool_use" | "thinking"
+    delta_type: str = ""    # "text_delta" | "input_json_delta" | "thinking_delta"
     text: str = ""
     tool_name: str = ""
     tool_id: str = ""

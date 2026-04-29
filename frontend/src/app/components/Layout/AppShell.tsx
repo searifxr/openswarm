@@ -37,6 +37,7 @@ import DashboardHost from '@/app/components/Layout/DashboardHost';
 import { useLastDashboardId } from '@/shared/hooks/useLastDashboardId';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { fetchDashboards, createDashboard, renameDashboard } from '@/shared/state/dashboardsSlice';
+import { setPendingFocusAgentId } from '@/shared/state/tempStateSlice';
 import { addBrowserCard, addBrowserTab } from '@/shared/state/dashboardLayoutSlice';
 import { setPendingBrowserUrl } from '@/shared/state/tempStateSlice';
 import { fetchOutputs } from '@/shared/state/outputsSlice';
@@ -232,6 +233,23 @@ const AppShell: React.FC = () => {
   useEffect(() => {
     try { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth)); } catch {}
   }, [sidebarWidth]);
+
+  // Native notification click handler. The notification helper fires a
+  // window event with the session id + dashboard id; bring the user back
+  // to that dashboard and queue a card focus.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {};
+      const { sessionId, dashboardId } = detail as { sessionId?: string; dashboardId?: string };
+      if (!sessionId) return;
+      if (dashboardId) {
+        navigate(`/dashboard/${dashboardId}`);
+      }
+      dispatch(setPendingFocusAgentId(sessionId));
+    };
+    window.addEventListener('openswarm:notification-click', handler as EventListener);
+    return () => window.removeEventListener('openswarm:notification-click', handler as EventListener);
+  }, [navigate, dispatch]);
 
   const handleResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();

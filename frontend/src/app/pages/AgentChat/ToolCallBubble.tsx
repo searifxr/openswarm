@@ -20,6 +20,7 @@ import CallSplitIcon from '@mui/icons-material/CallSplit';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { AgentMessage, expandSession, collapseSession, fetchSession } from '@/shared/state/agentsSlice';
+import { getToolLabel } from './toolLabels';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { placeCard, removeCard, setGlowingAgentCard, clearGlowingAgentCard, DEFAULT_CARD_W, DEFAULT_CARD_H, EXPANDED_CARD_MIN_H, GRID_GAP } from '@/shared/state/dashboardLayoutSlice';
 import { useClaudeTokens, useThemeMode } from '@/shared/styles/ThemeContext';
@@ -2007,7 +2008,14 @@ const ToolCallBubble: React.FC<ToolCallBubbleProps> = React.memo(
                 flexShrink: 0,
               }}
             >
-              {mcpInfo.isMcp ? mcpInfo.displayName : toolName}
+              {(() => {
+                if (mcpInfo.isMcp) return mcpInfo.displayName;
+                // Verb-tense progression: "Reading" while pending, "Read" once
+                // a tool_result has landed. Denied/streaming fall back to the
+                // present participle since the action is in-flight.
+                const { present, past } = getToolLabel(toolName);
+                return result && !isDenied ? past : present;
+              })()}
             </Typography>
             {mcpInfo.isMcp && (
               <Typography

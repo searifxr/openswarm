@@ -542,13 +542,16 @@ const ThinkingBubble: React.FC<{
   const toggle = () => setUserOverride(!expanded);
 
   const displayedSeconds = frozenElapsed ?? elapsed;
+  // Live token approximation: ~4 chars per token works well enough for a
+  // ticker. Skipped on history replay since `content` is fully populated
+  // and we don't want a misleading "still thinking" feel.
+  const text = typeof content === 'string' ? content : JSON.stringify(content);
+  const liveTokenEstimate = isStreaming ? Math.max(0, Math.round(text.length / 4)) : 0;
   const label = isStreaming
-    ? 'Thinking...'
+    ? (liveTokenEstimate > 0 ? `Thinking… (~${liveTokenEstimate} tokens)` : 'Thinking…')
     : startedStreamingAt !== null
       ? `Thought for ${displayedSeconds}s`
       : 'Thoughts';
-
-  const text = typeof content === 'string' ? content : JSON.stringify(content);
 
   // Shimmer colors — use a bright mid-tone against the muted base to make
   // the sweep visible without being loud. The base color matches the
@@ -740,6 +743,12 @@ const MessageBubble: React.FC<Props> = React.memo(({ message, editing = false, o
     ? content.slice(0, 200)
     : JSON.stringify(content).slice(0, 200);
 
+  // Optimistic-bubble visuals: dim the bubble until the server echoes it
+  // back (status: 'pending'), and tint it red on send failure.
+  const optimisticStatus = (message as any).optimistic_status as 'pending' | 'failed' | undefined;
+  const isPending = optimisticStatus === 'pending';
+  const isFailed = optimisticStatus === 'failed';
+
   return (
     <Box
       data-select-type="message"
@@ -756,12 +765,17 @@ const MessageBubble: React.FC<Props> = React.memo(({ message, editing = false, o
           maxWidth: '85%',
           minWidth: 0,
           bgcolor: isUser ? c.user.bubble : c.bg.surface,
-          border: isUser ? 'none' : `1px solid ${c.border.subtle}`,
+          border: isUser ? (isFailed ? `1px solid ${c.status.error}` : 'none') : `1px solid ${c.border.subtle}`,
           borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
           px: 2,
           py: 1.25,
           boxShadow: isUser ? 'none' : c.shadow.sm,
           overflow: 'hidden',
+          // Pending bubbles fade in at ~70% opacity until the server echo
+          // resolves them; failed bubbles get a soft red tint so the user
+          // can see the message didn't go through.
+          opacity: isPending ? 0.7 : 1,
+          transition: 'opacity 0.2s, border-color 0.2s',
         }}
       >
         {isUser ? (

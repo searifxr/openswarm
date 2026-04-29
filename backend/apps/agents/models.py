@@ -39,6 +39,11 @@ class Message(BaseModel):
     forced_tools: Optional[list[str]] = None
     images: Optional[list[dict]] = None
     hidden: bool = False
+    # Optional client-generated id used by the frontend to reconcile an
+    # optimistic message bubble (rendered synchronously on send) with the
+    # server-confirmed echo. Plumbed through send_message and round-tripped
+    # back via the agent:message WS event so the frontend can dedupe.
+    client_message_id: Optional[str] = None
 
 class MessageBranch(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)

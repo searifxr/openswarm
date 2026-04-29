@@ -38,6 +38,7 @@ import {
 import { fetchModes } from '@/shared/state/modesSlice';
 import { createSessionWs } from '@/shared/ws/WebSocketManager';
 import MessageBubble from './MessageBubble';
+import CompactionMarker from './CompactionMarker';
 import MessageActionBar from './MessageActionBar';
 import ToolCallBubble, { ToolPair } from './ToolCallBubble';
 import ToolGroupBubble, { RenderItem, ToolGroup, isToolGroup, isToolPair } from './ToolGroupBubble';
@@ -993,13 +994,33 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
               );
             })()}
             {renderItems.filter((item) => !session.streamingMessage || item.id !== session.streamingMessage.id).map((item) => {
+              const isCompactionAnchor = !!session.compacted_through_msg_id && item.id === session.compacted_through_msg_id;
+              const compactionChip = isCompactionAnchor ? (
+                <CompactionMarker
+                  key={`compaction-${item.id}`}
+                  collapsedCount={
+                    Math.max(0, renderItems.findIndex((it) => it.id === session.compacted_through_msg_id) + 1)
+                  }
+                />
+              ) : null;
+
               if (isToolGroup(item)) {
                 const groupMeta = session.tool_group_meta?.[item.id];
-                return <ToolGroupBubble key={item.id} group={item} isSessionRunning={sessionRunning} meta={groupMeta} sessionId={session.id} />;
+                return (
+                  <React.Fragment key={item.id}>
+                    <ToolGroupBubble group={item} isSessionRunning={sessionRunning} meta={groupMeta} sessionId={session.id} />
+                    {compactionChip}
+                  </React.Fragment>
+                );
               }
               if (isToolPair(item)) {
                 const isPending = item.result === null && sessionRunning;
-                return <ToolCallBubble key={item.id} call={item.call} result={item.result} isPending={isPending} sessionId={session.id} />;
+                return (
+                  <React.Fragment key={item.id}>
+                    <ToolCallBubble call={item.call} result={item.result} isPending={isPending} sessionId={session.id} />
+                    {compactionChip}
+                  </React.Fragment>
+                );
               }
               const msg = item;
               const isEditing = editingMessageId === msg.id;
@@ -1043,6 +1064,7 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
                       }
                     />
                   )}
+                  {compactionChip}
                 </Box>
               );
             })}

@@ -87,6 +87,7 @@ async def send_message(session_id: str, body: dict):
         attached_skills=body.get("attached_skills"),
         hidden=body.get("hidden", False),
         selected_browser_ids=body.get("selected_browser_ids"),
+        client_message_id=body.get("client_message_id"),
     )
     return {"ok": True}
 

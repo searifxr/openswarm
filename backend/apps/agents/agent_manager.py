@@ -2072,16 +2072,38 @@ class AgentManager:
                 "type": "preset",
                 "preset": "claude_code",
             }
+            # exclude_dynamic_sections=True tells the CLI to keep
+            # per-user/per-machine grounding (cwd, git status, recent
+            # commits, OS info) out of the cached system prompt prefix
+            # and re-inject it into the first user message instead. This
+            # makes the prefix byte-identical across users + sessions,
+            # which is what unlocks Anthropic's prompt cache (turn 2+
+            # gets a cache hit, ~80% input-token cost cut and 13–31%
+            # faster TTFT). The grounding info still reaches the model;
+            # only its position in the wire format changes.
+            #
+            # Trade-off: dynamic sections freeze at turn 1 — branch
+            # switches / large workspace state changes mid-session won't
+            # refresh until a new session starts. Acceptable for a
+            # multi-purpose agent canvas where most sessions aren't
+            # long-running coding marathons; coding-specific modes
+            # (view-builder, skill-builder) can flip this off later if
+            # we see drift complaints.
+            #
+            # Older bundled CLIs silently ignore the flag, so this is
+            # forward-safe; no version gate needed.
             if composed_prompt:
                 options_kwargs["system_prompt"] = {
                     "type": "preset",
                     "preset": "claude_code",
                     "append": composed_prompt,
+                    "exclude_dynamic_sections": True,
                 }
             else:
                 options_kwargs["system_prompt"] = {
                     "type": "preset",
                     "preset": "claude_code",
+                    "exclude_dynamic_sections": True,
                 }
             if session.max_turns:
                 options_kwargs["max_turns"] = session.max_turns
@@ -2786,6 +2808,7 @@ class AgentManager:
         attached_skills: list | None = None,
         hidden: bool = False,
         selected_browser_ids: list[str] | None = None,
+        client_message_id: str | None = None,
     ):
         """Send a follow-up message to an existing session."""
         session = self.sessions.get(session_id)
@@ -2855,6 +2878,7 @@ class AgentManager:
             forced_tools=forced_tools if forced_tools else None,
             images=image_meta,
             hidden=hidden,
+            client_message_id=client_message_id,
         )
         session.messages.append(user_msg)
         await ws_manager.send_to_session(session_id, "agent:message", {
