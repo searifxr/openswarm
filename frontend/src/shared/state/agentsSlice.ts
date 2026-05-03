@@ -30,6 +30,12 @@ export interface AgentMessage {
   // survives reload instead of decaying to "Thoughts".
   elapsed_ms?: number;
   tokens?: number;
+  // Richer thinking-pill data: total post-thinking output tokens
+  // (user-visible answer text + tool arguments) and tool invocation
+  // count. Drives the "Thought for 18s · 430 reasoning · 2.4K answer
+  // · 3 tools" label. Set on thinking messages only.
+  answer_tokens?: number;
+  tool_count?: number;
 }
 
 export interface ApprovalRequest {

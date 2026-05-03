@@ -80,13 +80,50 @@ function fmtSeconds(seconds: number): string {
   return `${hours}h ${minutes % 60}m`;
 }
 
-function getAgentWorkTime(messages: Array<{ role: string; timestamp: string }>, status: string): { total: number; last: number } {
+function getAgentWorkTime(
+  messages: Array<{ role: string; timestamp: string; elapsed_ms?: number }>,
+  status: string,
+): { total: number; last: number } {
+  // Preferred path: sum the per-turn `elapsed_ms` from `thinking` messages.
+  // This is the server-stamped real-work-duration that covers the WHOLE
+  // turn (think → tool → think → answer), not just the gap between user
+  // prompt and the first assistant message.
+  //
+  // We sum and round in MILLISECONDS, only converting to seconds at the
+  // very end via Math.round. This matches MessageBubble's pill rounding
+  // exactly so the two surfaces always agree (no off-by-one between
+  // header "4m 10s" and pill "4m 11s" caused by per-message flooring).
+  //
+  // Fallback path (legacy sessions / non-Anthropic providers without a
+  // thinking message): wall-clock between user prompt and first
+  // assistant/system reply.
+  let totalMs = 0;
+  let lastMs = 0;
+  let sawThinking = false;
+  for (const msg of messages) {
+    if (msg.role === 'thinking' && typeof msg.elapsed_ms === 'number' && msg.elapsed_ms > 0) {
+      sawThinking = true;
+      totalMs += msg.elapsed_ms;
+      lastMs = msg.elapsed_ms;
+    }
+  }
+
+  if (sawThinking) {
+    return {
+      total: Math.max(0, Math.round(totalMs / 1000)),
+      last: Math.max(0, Math.round(lastMs / 1000)),
+    };
+  }
+
+  // Legacy fallback: wall-clock between user prompts and the first
+  // assistant response. Kept for sessions saved before the thinking-
+  // message aggregator was wired (and for non-Anthropic providers in
+  // pathological "no thinking message at all" cases).
   let total = 0;
   let last = 0;
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg.role === 'user') {
-      // Find the next assistant/system response
       let endTime: number | null = null;
       for (let j = i + 1; j < messages.length; j++) {
         if (messages[j].role === 'assistant' || messages[j].role === 'system') {
@@ -95,12 +132,11 @@ function getAgentWorkTime(messages: Array<{ role: string; timestamp: string }>, 
         }
       }
       if (endTime) {
-        const dur = Math.max(0, Math.floor((endTime - new Date(msg.timestamp).getTime()) / 1000));
+        const dur = Math.max(0, Math.round((endTime - new Date(msg.timestamp).getTime()) / 1000));
         total += dur;
         last = dur;
       } else if (status === 'running' || status === 'waiting_approval') {
-        // Currently processing this prompt
-        const dur = Math.max(0, Math.floor((Date.now() - new Date(msg.timestamp).getTime()) / 1000));
+        const dur = Math.max(0, Math.round((Date.now() - new Date(msg.timestamp).getTime()) / 1000));
         total += dur;
         last = dur;
       }

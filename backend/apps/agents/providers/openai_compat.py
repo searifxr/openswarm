@@ -249,6 +249,8 @@ class OpenAICompatProvider(BaseProvider):
         # Track streaming state to emit normalized events
         text_started = False
         text_index = 0
+        thinking_started = False
+        thinking_index = 0
         tool_indices: dict[int, dict] = {}  # openai tool_call index -> {name, id, json_buf}
         next_block_index = 0
 
@@ -265,8 +267,51 @@ class OpenAICompatProvider(BaseProvider):
             delta = chunk.choices[0].delta
             finish_reason = chunk.choices[0].finish_reason
 
+            # Reasoning / thinking content. OpenAI o-series + GPT-5.x
+            # (via Responses API → 9Router → Chat Completions shape),
+            # DeepSeek-R1, and Gemini 2.5/3.x through 9Router all expose
+            # their reasoning text on `delta.reasoning_content`. Forward
+            # as a thinking content block so the frontend's existing
+            # ThinkingBubble pill renders it just like Anthropic's
+            # thinking_delta. The SDK's typed delta object doesn't
+            # declare this field so we read it via getattr/dict access.
+            reasoning_text: str | None = None
+            try:
+                reasoning_text = getattr(delta, "reasoning_content", None)
+                if reasoning_text is None and isinstance(delta, dict):
+                    reasoning_text = delta.get("reasoning_content")
+            except Exception:
+                reasoning_text = None
+            if reasoning_text:
+                # Reasoning blocks always close before any visible
+                # answer text starts; if we somehow got text first
+                # (shouldn't happen with reasoning models), don't
+                # interleave — just emit thinking after.
+                if not thinking_started:
+                    thinking_started = True
+                    thinking_index = next_block_index
+                    next_block_index += 1
+                    yield StreamEvent(
+                        type="content_block_start",
+                        index=thinking_index,
+                        block_type="thinking",
+                    )
+                yield StreamEvent(
+                    type="content_block_delta",
+                    index=thinking_index,
+                    delta_type="thinking_delta",
+                    text=reasoning_text,
+                )
+
             # Text content
             if delta.content is not None:
+                # Close any open thinking block before opening text — the
+                # transition from "thinking" to "answer" is what triggers
+                # the frontend pill to freeze. Mirrors Anthropic's
+                # content_block_stop on thinking before the text block.
+                if thinking_started:
+                    yield StreamEvent(type="content_block_stop", index=thinking_index)
+                    thinking_started = False
                 if not text_started:
                     text_started = True
                     text_index = next_block_index
@@ -288,10 +333,14 @@ class OpenAICompatProvider(BaseProvider):
                 for tc_delta in delta.tool_calls:
                     tc_idx = tc_delta.index
                     if tc_idx not in tool_indices:
-                        # New tool call starting
+                        # New tool call starting — close any open
+                        # text or thinking block first.
                         if text_started:
                             yield StreamEvent(type="content_block_stop", index=text_index)
                             text_started = False
+                        if thinking_started:
+                            yield StreamEvent(type="content_block_stop", index=thinking_index)
+                            thinking_started = False
 
                         block_idx = next_block_index
                         next_block_index += 1
@@ -323,6 +372,9 @@ class OpenAICompatProvider(BaseProvider):
 
             # Finish
             if finish_reason is not None:
+                if thinking_started:
+                    yield StreamEvent(type="content_block_stop", index=thinking_index)
+                    thinking_started = False
                 if text_started:
                     yield StreamEvent(type="content_block_stop", index=text_index)
                 for info in tool_indices.values():

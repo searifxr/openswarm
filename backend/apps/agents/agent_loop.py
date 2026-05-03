@@ -253,29 +253,18 @@ class AgentLoop:
                     thinking_total_chars += len(thinking_text)
 
                 # Send stream_end for tool + thinking blocks (text block
-                # ends at message_stop). Thinking ends here so the
-                # frontend can transition the pill from "live" to
-                # "Thought for Ns" the moment the model stops thinking,
-                # even if it then keeps streaming text.
+                # ends at message_stop). For thinking blocks we
+                # intentionally DO NOT include per-block elapsed_ms /
+                # tokens — those would freeze the pill early on a
+                # multi-block turn (think → tool → think → answer)
+                # showing only the first block's stats. Instead the pill
+                # stays in "thinking…" until the per-turn aggregate
+                # arrives via the agent:message event for this turn's
+                # persisted Message(role="thinking"), which carries
+                # thinking_total_ms and the heuristic-or-9Router-truthed
+                # token count for the WHOLE turn.
                 if msg_id and (bt == "tool_use" or bt == "thinking"):
-                    payload: dict[str, Any] = {"message_id": msg_id}
-                    if bt == "thinking":
-                        # Server-stamped truth so the persisted bubble
-                        # doesn't fall back to "Thoughts" — and so the
-                        # live bubble freezes on the exact server-side
-                        # duration instead of the client's clock.
-                        block_start = block_start_ts.get(event.index)
-                        if block_start is not None:
-                            block_elapsed = int((time.time() - block_start) * 1000)
-                            payload["elapsed_ms"] = block_elapsed
-                        # Token estimate for THIS block (chars/3.6 ≈
-                        # Anthropic BPE for English prose). Matches the
-                        # heuristic the live UI used so the freeze
-                        # value doesn't visually jump.
-                        block_text = text_buffers.get(event.index, "")
-                        if block_text:
-                            payload["tokens"] = max(1, round(len(block_text) / 3.6))
-                    await self.ws_emitter("agent:stream_end", payload)
+                    await self.ws_emitter("agent:stream_end", {"message_id": msg_id})
 
             elif event.type == "usage":
                 # Accumulate token usage from provider stream
@@ -326,6 +315,29 @@ class AgentLoop:
         thinking_parts = [b.text for b in content if b.type == "thinking" and b.text]
         if thinking_parts:
             joined = "\n\n".join(thinking_parts)
+            # Token count source preference:
+            #   1. 9Router's stored reasoning_tokens / thoughtsTokenCount —
+            #      exact, available for OpenAI/Gemini/DeepSeek when routed
+            #      through 9Router.
+            #   2. chars/3.6 heuristic — Anthropic's API doesn't expose a
+            #      per-block thinking-token count, so we fall back to the
+            #      same BPE-ish approximation we use for the live counter.
+            tokens_value: int | None = None
+            try:
+                from backend.apps.nine_router import (
+                    get_latest_reasoning_tokens,
+                    is_running as _9r_running,
+                )
+                if _9r_running():
+                    rt = await get_latest_reasoning_tokens(model_hint=self.model)
+                    if rt and rt > 0:
+                        tokens_value = rt
+            except Exception:
+                # 9Router is best-effort; fall back to heuristic silently.
+                pass
+            if tokens_value is None and thinking_total_chars:
+                tokens_value = max(1, round(thinking_total_chars / 3.6))
+
             # Stamp duration + token estimate so the persisted bubble can
             # show "Thought for Ns · M tokens" on reload instead of the
             # generic "Thoughts" fallback. Use the server-side accumulated
@@ -334,7 +346,7 @@ class AgentLoop:
                 role="thinking",
                 content=joined,
                 elapsed_ms=thinking_elapsed_ms or None,
-                tokens=max(1, round(thinking_total_chars / 3.6)) if thinking_total_chars else None,
+                tokens=tokens_value,
             )
             await self.ws_emitter("agent:message", {
                 "message": msg.model_dump(mode="json"),

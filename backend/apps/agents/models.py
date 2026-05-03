@@ -56,6 +56,23 @@ class Message(BaseModel):
     # number frozen on the persisted bubble matches what the user saw
     # rising during the stream. Pure display, not billing.
     tokens: Optional[int] = None
+    # Richer thinking-pill label data. Populated only on Message(role=
+    # "thinking") for live turns; legacy messages and non-thinking roles
+    # leave them None. answer_tokens = total turn output - reasoning
+    # tokens (the user-visible answer text + tool args). tool_count =
+    # how many tools the model invoked on this turn. Drives the
+    # "Thought for 18s · 430 reasoning · 2.4K answer · 3 tools" label.
+    answer_tokens: Optional[int] = None
+    tool_count: Optional[int] = None
+    # Gemini 2.5/3.x emit a `thoughtSignature` (an opaque encrypted
+    # blob) on each thinking block, and Google rejects subsequent
+    # multi-step requests with a 400 if the signature isn't echoed
+    # back in the conversation history. We capture it here on
+    # role="thinking" messages so it survives serialization through
+    # session.json AND can be re-attached to the assistant turn we
+    # send back through the SDK on the next request. None for any
+    # provider that doesn't use signatures (Anthropic, OpenAI).
+    thought_signature: Optional[str] = None
 
 class MessageBranch(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)

@@ -33,6 +33,26 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "3600000")
 
 
+def _safe_resp_text(resp) -> str:
+    """Extract text from an Anthropic-shape response, tolerating Gemini/OpenAI
+    edge cases. Gemini through 9Router occasionally returns `content=[]` (e.g.
+    safety stop, function-call-only turn) which makes `resp.content[0].text`
+    raise `'NoneType' object is not subscriptable` and bubbles up as a
+    fallback-required path. This walks the content list looking for the first
+    text block and returns "" if none exists, so callers can decide their own
+    fallback without a raw IndexError.
+    """
+    try:
+        blocks = getattr(resp, "content", None) or []
+        for b in blocks:
+            t = getattr(b, "text", None)
+            if isinstance(t, str) and t:
+                return t
+        return ""
+    except Exception:
+        return ""
+
+
 def _save_session(session_id: str, doc_data: dict):
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(os.path.join(SESSIONS_DIR, f"{session_id}.json"), "w") as f:
@@ -2123,6 +2143,27 @@ class AgentManager:
             # reasoning params are applied by 9Router (see resolve_model_id).
             try:
                 level = getattr(session, "thinking_level", "auto") or "auto"
+                # Gemini CLI safety override: if the request is going out via
+                # gc/<gemini-3*> (i.e. the Antigravity bypass didn't engage —
+                # AG isn't connected, or the model isn't in _ANTIGRAVITY_MAP),
+                # the thoughtSignature continuity check will 400 every multi-
+                # step tool turn. Our SDK has no hook to round-trip the
+                # signature, so the only stable path is to disable thinking
+                # entirely (thinkingBudget=0). Surface a one-line log so users
+                # who *expected* reasoning know why it didn't appear.
+                if (
+                    isinstance(resolved_model, str)
+                    and resolved_model.startswith("gc/gemini-3")
+                    and level != "off"
+                ):
+                    logger.info(
+                        "Forcing thinking_level=off for %s — gc/ enforces "
+                        "thoughtSignature continuity that the Anthropic SDK "
+                        "can't round-trip. Connect Antigravity or use the "
+                        "API-key variant for reasoning traces.",
+                        resolved_model,
+                    )
+                    level = "off"
                 if api_type == "anthropic":
                     if level == "off":
                         options_kwargs["thinking"] = {"type": "disabled"}
@@ -2222,6 +2263,61 @@ class AgentManager:
             stream_text_msg_id = None
             stream_tool_msg_ids_ordered = []
             stream_block_index_map = {}
+            # Per-turn aggregate trackers for the consolidated thinking
+            # message. We accumulate across every AssistantMessage in the
+            # turn (think → tool → think → tool → answer) and stream
+            # incremental updates to the SAME persisted Message id so the
+            # ThinkingBubble pill ticks live: "Thought for 18s · 412
+            # tokens · 3 tools used". Reset only at turn boundaries.
+            _thinking_block_starts: dict[int, float] = {}
+            _thinking_total_ms: int = 0
+            _thinking_total_chars: int = 0
+            # Persistent id for the turn's single thinking message. We
+            # reuse it across multi-step turns so the frontend's
+            # addMessage dedupe replaces the bubble in place rather
+            # than stacking N pills above the answer. Reset at the
+            # next user turn (next prompt_stream iteration).
+            _turn_thinking_msg_id: str | None = None
+            _turn_thinking_text_parts: list[str] = []
+            _turn_tool_count: int = 0
+            _turn_started_ts: float | None = None
+            # Wall-clock turn duration (ms) — covers thinking + tool
+            # execution + assistant text. Updated continuously as the
+            # turn unfolds. Used for the "Thought for Ns" segment so
+            # the duration reflects the entire user-visible wait, not
+            # just thinking-only time.
+            _turn_total_ms: int = 0
+            # Total output tokens across every AssistantMessage in the
+            # turn (thinking + visible text + tool-call JSON args). The
+            # consolidated thinking pill's `tokens` segment uses this
+            # rather than thinking-text-only chars/3.6 — answers the
+            # question "how much work did the model produce on this
+            # turn" honestly. Populated from each AssistantMessage's
+            # usage.output_tokens; fallback heuristic kicks in only
+            # when usage is absent.
+            _turn_output_tokens: int = 0
+            # Running char counts for the streaming portions of the
+            # turn — used to grow the token estimate while assistant
+            # text and tool-call JSON args are still streaming, BEFORE
+            # the SDK has emitted a final usage.output_tokens count
+            # for those blocks. Once the AssistantMessage lands with
+            # real usage data, _turn_output_tokens supersedes these.
+            _turn_assistant_text_chars: int = 0
+            _turn_tool_input_chars: int = 0
+            # Latest Gemini thoughtSignature captured from this turn's
+            # ThinkingBlocks. We persist it on the consolidated thinking
+            # Message so subsequent turns can re-attach it to the
+            # assistant turn we feed back to Gemini, satisfying
+            # Google's reasoning-continuity check (the source of the
+            # "Thought signature is not valid" 400). None for providers
+            # that don't use signatures.
+            _turn_thought_signature: str | None = None
+            # Background ticker handle. Re-emits the consolidated
+            # thinking message every 1s so the elapsed counter keeps
+            # ticking through gaps where no SDK events fire (tool
+            # execution, slow text generation). Started at first
+            # AssistantMessage of the turn, cancelled at ResultMessage.
+            _ticker_task: asyncio.Task | None = None
             _turn_number = 0
             _first_event = True
             # True between the first non-ResultMessage of a turn and the
@@ -2239,9 +2335,158 @@ class AgentManager:
             # error handler unchanged.
             _CAPACITY_BACKOFFS = [5, 15, 45, 90, 180]
 
+            async def _emit_consolidated_thinking(force_provider_unavailable: bool = False) -> None:
+                """Build the running aggregate Message and broadcast it.
+                Safe to call multiple times — uses a stable per-turn id
+                so the frontend dedupes by id and updates the bubble in
+                place.
+
+                Emission rule: emit when ANY of the following is true:
+                  1. Reasoning text exists (Anthropic happy path).
+                  2. Upstream provider reported reasoning tokens via
+                     9Router (best-effort path for GPT/Gemini).
+                  3. force_provider_unavailable=True — caller has
+                     determined this turn went through a translator that
+                     doesn't carry reasoning content (cx/ or gc/), and
+                     the user should see a "provider doesn't expose
+                     reasoning text" pill regardless of metric
+                     availability. This is what makes GPT/Gemini turns
+                     show a pill even when 9Router can't surface a
+                     token count.
+                """
+                nonlocal _turn_thinking_msg_id, _turn_total_ms
+                upstream_reasoning_tokens: int | None = None
+                # Probe 9Router for the upstream reasoning-token count
+                # whenever (a) there's no in-process text, OR (b) the
+                # caller flagged this as a force-emit for a route that
+                # strips reasoning. Case (b) is what makes the FINAL
+                # emit on GPT/Gemini show the real reasoning count
+                # (e.g. 196) instead of the heuristic chars/3.6 of the
+                # answer text (e.g. 13).
+                if not _turn_thinking_text_parts or force_provider_unavailable:
+                    try:
+                        from backend.apps.nine_router import (
+                            get_latest_reasoning_tokens,
+                            is_running as _9r_running,
+                        )
+                        if _9r_running():
+                            rt = await get_latest_reasoning_tokens(model_hint=session.model)
+                            if rt and rt > 0:
+                                upstream_reasoning_tokens = rt
+                    except Exception:
+                        pass
+                    if (
+                        not _turn_thinking_text_parts
+                        and upstream_reasoning_tokens is None
+                        and not force_provider_unavailable
+                    ):
+                        # No text, no upstream signal, and caller didn't
+                        # ask for the unavailable-pill — nothing to show.
+                        return
+                joined_text = "\n".join(_turn_thinking_text_parts)
+                # Total turn output token estimate. Combines two sources:
+                #   - SDK usage.output_tokens summed across completed
+                #     AssistantMessages (authoritative for finished
+                #     blocks).
+                #   - chars/3.6 heuristic over the running streams of
+                #     thinking + assistant-text + tool-input JSON
+                #     (covers in-flight blocks the SDK hasn't billed
+                #     yet — i.e. the answer the user is currently
+                #     reading).
+                # Take the max so the number doesn't visually shrink as
+                # the SDK's authoritative count overtakes our running
+                # heuristic.
+                running_chars = (
+                    len(joined_text)
+                    + _turn_assistant_text_chars
+                    + _turn_tool_input_chars
+                )
+                heuristic_tokens = max(1, round(running_chars / 3.6)) if running_chars else 0
+                turn_tokens: int | None = None
+                # Priority order:
+                #   1. Upstream reasoning-token count from 9Router (the
+                #      only honest signal for GPT/Gemini, captured above).
+                #   2. SDK-reported usage.output_tokens (Anthropic).
+                #   3. chars/3.6 heuristic over running streams (live UI).
+                if upstream_reasoning_tokens and upstream_reasoning_tokens > 0:
+                    turn_tokens = upstream_reasoning_tokens
+                elif _turn_output_tokens > 0 or heuristic_tokens > 0:
+                    turn_tokens = max(_turn_output_tokens, heuristic_tokens)
+                else:
+                    try:
+                        from backend.apps.nine_router import (
+                            get_latest_reasoning_tokens,
+                            is_running as _9r_running,
+                        )
+                        if _9r_running():
+                            rt = await get_latest_reasoning_tokens(model_hint=session.model)
+                            if rt and rt > 0:
+                                turn_tokens = rt
+                    except Exception:
+                        pass
+                if _turn_started_ts is not None:
+                    _turn_total_ms = int((time.time() - _turn_started_ts) * 1000)
+                if _turn_thinking_msg_id is None:
+                    _turn_thinking_msg_id = uuid4().hex
+                consolidated = Message(
+                    id=_turn_thinking_msg_id,
+                    role="thinking",
+                    content=joined_text,
+                    branch_id=session.active_branch_id,
+                    elapsed_ms=_turn_total_ms or None,
+                    tokens=turn_tokens,
+                    tool_count=_turn_tool_count or None,
+                    # Persist Gemini thoughtSignature so we can re-attach
+                    # it on the next request — this is what stops Google
+                    # from rejecting multi-step turns with "Thought
+                    # signature is not valid" 400. None for any provider
+                    # that doesn't use signatures.
+                    thought_signature=_turn_thought_signature,
+                )
+                existing_idx = next(
+                    (i for i, m in enumerate(session.messages)
+                     if m.id == _turn_thinking_msg_id),
+                    -1,
+                )
+                if existing_idx >= 0:
+                    session.messages[existing_idx] = consolidated
+                else:
+                    session.messages.append(consolidated)
+                try:
+                    await ws_manager.send_to_session(session_id, "agent:message", {
+                        "session_id": session_id,
+                        "message": consolidated.model_dump(mode="json"),
+                    })
+                except Exception:
+                    logger.exception("Failed to emit consolidated thinking message")
+
+            async def _ticker_loop():
+                """Re-emit the consolidated thinking message every 1s so
+                the elapsed-time counter keeps ticking through gaps
+                where no SDK events fire (e.g. while a tool is running
+                or while assistant text is being generated). Cancelled
+                at turn boundaries from `ResultMessage`."""
+                try:
+                    while True:
+                        await asyncio.sleep(1.0)
+                        await _emit_consolidated_thinking()
+                except asyncio.CancelledError:
+                    pass
+
             async def _run_streaming_turn():
                 nonlocal stream_text_msg_id, stream_tool_msg_ids_ordered, stream_block_index_map
                 nonlocal _turn_number, _first_event, _current_turn_emitted
+                # Per-turn thinking aggregation trackers (added for the
+                # "Thought for Ns · M tokens" persisted label). Without
+                # nonlocal, the int reassignments at AssistantMessage emission
+                # below shadow them as locals and the dict access at
+                # content_block_start crashes with UnboundLocalError.
+                nonlocal _thinking_block_starts, _thinking_total_ms, _thinking_total_chars
+                nonlocal _turn_thinking_msg_id, _turn_thinking_text_parts
+                nonlocal _turn_tool_count, _turn_started_ts, _turn_total_ms
+                nonlocal _turn_output_tokens, _ticker_task
+                nonlocal _turn_assistant_text_chars, _turn_tool_input_chars
+                nonlocal _turn_thought_signature
                 async for message in query(
                     prompt=prompt_stream(),
                     options=options,
@@ -2250,6 +2495,32 @@ class AgentManager:
                         _current_turn_emitted = False
                     else:
                         _current_turn_emitted = True
+                        # Stamp the turn's wall-clock start at the FIRST
+                        # non-Result message we see — this is when the
+                        # user actually started waiting. We use the same
+                        # timestamp as the basis for "Thought for Ns"
+                        # so the duration covers thinking + tool exec
+                        # + assistant text generation.
+                        if _turn_started_ts is None:
+                            _turn_started_ts = time.time()
+                            # Pre-emit thinking pill for routes whose
+                            # translator strips reasoning content (cx/, gc/,
+                            # ag/, gemini/). Without this, the pill emits
+                            # at turn end and lands BELOW the assistant
+                            # text in session.messages — visually wrong.
+                            # Pre-emitting here gives the pill the same
+                            # ordering as Anthropic's natural streaming
+                            # path. Updates in place at turn end via the
+                            # stable _turn_thinking_msg_id dedupe.
+                            try:
+                                _route_strips_reasoning_pre = (
+                                    isinstance(resolved_model, str)
+                                    and resolved_model.startswith(("cx/", "gc/", "ag/", "gemini/"))
+                                )
+                                if _route_strips_reasoning_pre:
+                                    await _emit_consolidated_thinking(force_provider_unavailable=True)
+                            except Exception:
+                                logger.exception("pre-emit thinking pill failed; continuing")
 
                     if _first_event:
                         logger.info(f"[MCP-DEBUG] First event received: {type(message).__name__}")
@@ -2289,6 +2560,11 @@ class AgentManager:
                                 # the DynamicIsland/agent card rendering.
                                 thinking_msg_id = uuid4().hex
                                 stream_block_index_map[index] = thinking_msg_id
+                                # Server-stamp start so we can accumulate
+                                # per-turn elapsed_ms across multiple
+                                # thinking blocks (think → tool → think
+                                # → answer turns sum correctly).
+                                _thinking_block_starts[index] = time.time()
                                 await ws_manager.send_to_session(session_id, "agent:stream_start", {
                                     "session_id": session_id,
                                     "message_id": thinking_msg_id,
@@ -2299,6 +2575,22 @@ class AgentManager:
                                 tool_msg_id = uuid4().hex
                                 stream_tool_msg_ids_ordered.append(tool_msg_id)
                                 stream_block_index_map[index] = tool_msg_id
+                                # Stream-level tool count for the
+                                # consolidated thinking pill. The
+                                # AssistantMessage path (further down)
+                                # ALSO increments _turn_tool_count when
+                                # ToolUseBlocks fully arrive — but for
+                                # OpenAI/Gemini through 9Router the
+                                # AssistantMessage envelope is sometimes
+                                # incomplete, so this stream-level count
+                                # is what guarantees the "N tools used"
+                                # segment renders cross-provider. To
+                                # avoid double-counting we DON'T also
+                                # increment on AssistantMessage when
+                                # this code path already fired — see
+                                # the dedupe at the AssistantMessage
+                                # block below.
+                                _turn_tool_count += 1
                                 await ws_manager.send_to_session(session_id, "agent:stream_start", {
                                     "session_id": session_id,
                                     "message_id": tool_msg_id,
@@ -2313,29 +2605,45 @@ class AgentManager:
                             msg_id = stream_block_index_map.get(index)
 
                             if msg_id and delta_type == "text_delta":
+                                _text_chunk = delta.get("text", "")
+                                _turn_assistant_text_chars += len(_text_chunk)
                                 await ws_manager.send_to_session(session_id, "agent:stream_delta", {
                                     "session_id": session_id,
                                     "message_id": msg_id,
-                                    "delta": delta.get("text", ""),
+                                    "delta": _text_chunk,
                                 })
                             elif msg_id and delta_type == "thinking_delta":
                                 # Thinking content streams as thinking_delta
                                 # with a "thinking" field (not "text")
+                                _think_chunk = delta.get("thinking", "")
+                                _thinking_total_chars += len(_think_chunk)
                                 await ws_manager.send_to_session(session_id, "agent:stream_delta", {
                                     "session_id": session_id,
                                     "message_id": msg_id,
-                                    "delta": delta.get("thinking", ""),
+                                    "delta": _think_chunk,
                                 })
                             elif msg_id and delta_type == "input_json_delta":
+                                _json_chunk = delta.get("partial_json", "")
+                                _turn_tool_input_chars += len(_json_chunk)
                                 await ws_manager.send_to_session(session_id, "agent:stream_delta", {
                                     "session_id": session_id,
                                     "message_id": msg_id,
-                                    "delta": delta.get("partial_json", ""),
+                                    "delta": _json_chunk,
                                 })
 
                         elif event_type == "content_block_stop":
                             index = event.get("index")
                             msg_id = stream_block_index_map.get(index)
+                            # If this was a thinking block, accumulate
+                            # elapsed_ms server-side. We don't include
+                            # per-block elapsed/tokens on the WS event
+                            # — the pill stays in "Thinking…" until the
+                            # AssistantMessage lands carrying the per-turn
+                            # aggregate values.
+                            if index in _thinking_block_starts:
+                                _thinking_total_ms += int(
+                                    (time.time() - _thinking_block_starts.pop(index)) * 1000
+                                )
                             if msg_id and msg_id != stream_text_msg_id:
                                 await ws_manager.send_to_session(session_id, "agent:stream_end", {
                                     "session_id": session_id,
@@ -2351,13 +2659,32 @@ class AgentManager:
 
                     elif isinstance(message, AssistantMessage):
                         content_parts = []
-                        thinking_parts = []
+                        new_thinking_parts = []
                         tool_uses = []
+                        # Capture the latest Gemini thoughtSignature
+                        # (and Anthropic's signature_delta if present)
+                        # off any ThinkingBlock in this message. We
+                        # store it on the turn's consolidated thinking
+                        # message so it survives session.json
+                        # serialization, and re-attach it on the next
+                        # request so Google's continuity check passes.
+                        new_thought_signature: str | None = None
                         for block in message.content:
                             if isinstance(block, ThinkingBlock):
                                 thinking_text = getattr(block, "thinking", None) or getattr(block, "text", None) or ""
                                 if thinking_text:
-                                    thinking_parts.append(thinking_text)
+                                    new_thinking_parts.append(thinking_text)
+                                # Try multiple field-name variants — SDK
+                                # versions and 9Router translations have
+                                # used `signature`, `thoughtSignature`,
+                                # and `thought_signature` over time.
+                                _sig = (
+                                    getattr(block, "signature", None)
+                                    or getattr(block, "thoughtSignature", None)
+                                    or getattr(block, "thought_signature", None)
+                                )
+                                if _sig:
+                                    new_thought_signature = _sig
                             elif isinstance(block, TextBlock):
                                 content_parts.append(block.text)
                             elif isinstance(block, ToolUseBlock):
@@ -2367,20 +2694,65 @@ class AgentManager:
                                     "input": block.input,
                                 })
 
-                        # Emit thinking trace as a separate message so the
-                        # frontend can render it as a collapsible reasoning
-                        # bubble (GPT-5.3 Codex, Gemini 3 Pro/Flash).
-                        if thinking_parts:
-                            thinking_msg = Message(
-                                role="thinking",
-                                content="\n".join(thinking_parts),
-                                branch_id=session.active_branch_id,
-                            )
-                            session.messages.append(thinking_msg)
-                            await ws_manager.send_to_session(session_id, "agent:message", {
-                                "session_id": session_id,
-                                "message": thinking_msg.model_dump(mode="json"),
-                            })
+                        # Accumulate this AssistantMessage's contributions
+                        # into the turn-level thinking pill. We re-emit
+                        # the SAME message id each time so the frontend
+                        # dedupes (addMessage replaces by id) and the
+                        # bubble updates live as more thought / tools
+                        # arrive. This is what gives us "Thought for 18s
+                        # · 412 tokens · 3 tools used" reflecting the
+                        # whole turn rather than just one think-step.
+                        #
+                        # NOTE: tool count is incremented in the
+                        # content_block_start (block_type=="tool_use")
+                        # branch above, NOT here. That path fires for
+                        # both Anthropic and 9Router-translated
+                        # providers; counting again here would double.
+                        # If a provider somehow doesn't surface
+                        # content_block_start for tool blocks but DOES
+                        # surface them in the AssistantMessage envelope
+                        # (defensive case), the max() in the
+                        # consolidated emit will still pick up the
+                        # higher count.
+                        if new_thinking_parts:
+                            _turn_thinking_text_parts.extend(new_thinking_parts)
+                        # Latch the most recent thoughtSignature — Gemini
+                        # only validates against the LATEST one in the
+                        # conversation history, so older signatures from
+                        # earlier think-steps in the same turn are
+                        # superseded by newer ones.
+                        if new_thought_signature:
+                            _turn_thought_signature = new_thought_signature
+                        # Accumulate this message's total output tokens
+                        # (SDK populates `usage.output_tokens` with the
+                        # full output for the inference: thinking text +
+                        # visible text + tool-call JSON args). Summing
+                        # across the turn's AssistantMessages gives us
+                        # "all output the model produced this turn,"
+                        # which is what users intuit when they see a
+                        # token count.
+                        try:
+                            _msg_usage = getattr(message, "usage", None) or {}
+                            if isinstance(_msg_usage, dict):
+                                _ot = int(_msg_usage.get("output_tokens", 0) or 0)
+                                if _ot > 0:
+                                    _turn_output_tokens += _ot
+                        except Exception:
+                            pass
+
+                        # Re-emit the consolidated thinking message on
+                        # every AssistantMessage (event-driven). The
+                        # background ticker loop keeps it updating
+                        # between events too, so the elapsed counter
+                        # ticks even during tool execution / slow text
+                        # generation gaps.
+                        if _turn_thinking_text_parts:
+                            await _emit_consolidated_thinking()
+                            # Start the 1Hz ticker once we have a
+                            # consolidated message in flight so the
+                            # bubble keeps updating between SDK events.
+                            if _ticker_task is None or _ticker_task.done():
+                                _ticker_task = asyncio.create_task(_ticker_loop())
 
                         if content_parts:
                             asst_msg = Message(
@@ -2416,6 +2788,73 @@ class AgentManager:
                         stream_block_index_map = {}
 
                     elif isinstance(message, ResultMessage):
+                        # ResultMessage carries the AUTHORITATIVE per-turn
+                        # output_tokens count. Some providers (notably
+                        # OpenAI/Gemini through 9Router) only populate
+                        # `usage.output_tokens` here — not on individual
+                        # AssistantMessages. Fold this into the running
+                        # turn aggregate BEFORE emitting the final
+                        # consolidated thinking message, so the bubble's
+                        # tokens segment reflects ground truth on those
+                        # providers too.
+                        try:
+                            _result_usage = getattr(message, "usage", None) or {}
+                            if isinstance(_result_usage, dict):
+                                _result_out = int(_result_usage.get("output_tokens", 0) or 0)
+                                # Take the max — if individual
+                                # AssistantMessages already summed to a
+                                # larger number we trust that; otherwise
+                                # ResultMessage's count fills the gap.
+                                if _result_out > _turn_output_tokens:
+                                    _turn_output_tokens = _result_out
+                        except Exception:
+                            pass
+
+                        # Final consolidated emission with the full
+                        # duration + authoritative tokens. The frontend
+                        # bubble freezes on this final value.
+                        # For routes whose translator strips reasoning
+                        # content (cx/ for OpenAI, gc/ for Gemini),
+                        # force-emit a pill even when no text or upstream
+                        # token count was captured. Without this, GPT/
+                        # Gemini turns show no thinking bubble at all
+                        # because 9Router's translator doesn't carry
+                        # reasoning_content across the Anthropic-shape
+                        # round-trip. The frontend's ThinkingBubble
+                        # detects empty content and renders a friendly
+                        # "provider doesn't expose reasoning text"
+                        # explanation instead of a blank panel.
+                        _route_strips_reasoning = (
+                            isinstance(resolved_model, str)
+                            and resolved_model.startswith(("cx/", "gc/", "ag/", "gemini/"))
+                        )
+                        if _turn_thinking_text_parts or _route_strips_reasoning:
+                            try:
+                                await _emit_consolidated_thinking(
+                                    force_provider_unavailable=_route_strips_reasoning,
+                                )
+                            except Exception:
+                                pass
+                        if _ticker_task is not None and not _ticker_task.done():
+                            _ticker_task.cancel()
+                            try:
+                                await _ticker_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        _ticker_task = None
+                        _turn_thinking_msg_id = None
+                        _turn_thinking_text_parts = []
+                        _turn_tool_count = 0
+                        _turn_started_ts = None
+                        _turn_total_ms = 0
+                        _turn_output_tokens = 0
+                        _turn_assistant_text_chars = 0
+                        _turn_tool_input_chars = 0
+                        _turn_thought_signature = None
+                        _thinking_total_ms = 0
+                        _thinking_total_chars = 0
+                        _thinking_block_starts = {}
+
                         session.sdk_session_id = getattr(message, "session_id", None)
                         cost = getattr(message, "total_cost_usd", None)
                         if cost is not None:
@@ -2462,6 +2901,17 @@ class AgentManager:
                     await _run_streaming_turn()
                     break
                 except Exception as e:
+                    # Make sure the consolidated-thinking ticker doesn't
+                    # outlive the turn on error/retry. Without this, an
+                    # exception mid-stream leaves a dangling task that
+                    # keeps re-emitting against a stale msg id.
+                    if _ticker_task is not None and not _ticker_task.done():
+                        _ticker_task.cancel()
+                        try:
+                            await _ticker_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    _ticker_task = None
                     stderr_snapshot = "\n".join(_stderr_buffer[-50:])
                     if (
                         _is_transient_capacity_error(e, extra_text=stderr_snapshot)
@@ -3092,11 +3542,15 @@ class AgentManager:
 
         title = first_prompt[:40].strip()
         try:
-            from backend.apps.settings.credentials import get_anthropic_client
-            from backend.apps.agents.providers.registry import resolve_aux_model
+            from backend.apps.settings.credentials import get_anthropic_client_for_model
+            from backend.apps.agents.providers.registry import resolve_aux_model, get_api_type
             global_settings = load_settings()
-            aux_model, _aux_base = await resolve_aux_model(global_settings, preferred_tier="haiku")
-            client = get_anthropic_client(global_settings)
+            aux_model, _aux_base = await resolve_aux_model(
+                global_settings,
+                preferred_tier="haiku",
+                primary_api=get_api_type(session.model),
+            )
+            client = get_anthropic_client_for_model(global_settings, aux_model)
             system_prompt = (
                 "You label user messages with a 2-4 word topic title. "
                 "You NEVER answer the message. You NEVER describe yourself or your capabilities. "
@@ -3121,7 +3575,7 @@ class AgentManager:
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_turn}],
             )
-            generated = resp.content[0].text.strip().strip('"\'')
+            generated = _safe_resp_text(resp).strip().strip('"\'')
             if generated:
                 title = generated
         except Exception as e:
@@ -3153,11 +3607,17 @@ class AgentManager:
         (cheap-tier of whichever provider the user has connected).
         """
         try:
-            from backend.apps.settings.credentials import get_anthropic_client
-            from backend.apps.agents.providers.registry import resolve_aux_model
+            from backend.apps.settings.credentials import get_anthropic_client_for_model
+            from backend.apps.agents.providers.registry import resolve_aux_model, get_api_type
             global_settings = load_settings()
-            aux_model, _ = await resolve_aux_model(global_settings, preferred_tier="haiku")
-            client = get_anthropic_client(global_settings)
+            session = self.sessions.get(session_id)
+            primary_api = get_api_type(session.model) if session else None
+            aux_model, _ = await resolve_aux_model(
+                global_settings,
+                preferred_tier="haiku",
+                primary_api=primary_api,
+            )
+            client = get_anthropic_client_for_model(global_settings, aux_model)
 
             system = (
                 "You generate a 1-6 word verb-phrase describing what an AI assistant "
@@ -3185,7 +3645,9 @@ class AgentManager:
                     ),
                 }],
             )
-            label = resp.content[0].text.strip().strip('"\'').strip('.')
+            label = _safe_resp_text(resp).strip().strip('"\'').strip('.')
+            if not label:
+                return
             # Defensive: cap length and strip leading 'I' / first-person if it
             # slipped through despite the system prompt.
             if label.lower().startswith(("i ", "i'm ", "i'll ")):
@@ -3267,11 +3729,15 @@ class AgentManager:
 
         try:
             import json as _json
-            from backend.apps.settings.credentials import get_anthropic_client
-            from backend.apps.agents.providers.registry import resolve_aux_model
+            from backend.apps.settings.credentials import get_anthropic_client_for_model
+            from backend.apps.agents.providers.registry import resolve_aux_model, get_api_type
             global_settings = load_settings()
-            aux_model, _aux_base = await resolve_aux_model(global_settings, preferred_tier="sonnet")
-            client = get_anthropic_client(global_settings)
+            aux_model, _aux_base = await resolve_aux_model(
+                global_settings,
+                preferred_tier="sonnet",
+                primary_api=get_api_type(session.model),
+            )
+            client = get_anthropic_client_for_model(global_settings, aux_model)
 
             tool_desc = "\n".join(
                 f"- {tc.get('tool', '?')}: {tc.get('input_summary', '')}" for tc in tool_calls
@@ -3310,7 +3776,9 @@ class AgentManager:
                 messages=[{"role": "user", "content": user_content}],
             )
 
-            raw = resp.content[0].text.strip()
+            raw = _safe_resp_text(resp).strip()
+            if not raw:
+                raise ValueError("aux model returned empty content")
             if raw.startswith("```"):
                 raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             parsed = _json.loads(raw)

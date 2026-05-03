@@ -507,21 +507,27 @@ const ThinkingBubble: React.FC<{
   // disappear when the streaming bubble unmounts.
   persistedElapsedMs?: number;
   persistedTokens?: number;
+  // Tool invocation count for this turn — drives the "3 tools used"
+  // segment of the post-stream label.
+  persistedToolCount?: number;
   // Aux-LLM-generated dynamic label for the active turn ("Auditing the
   // pull request", "Drafting your email"). Replaces the static
   // "Thinking…" verb when present and the stream is still active.
   dynamicLabel?: string | null;
-}> = ({ content, isStreaming, persistedElapsedMs, persistedTokens, dynamicLabel }) => {
+}> = ({ content, isStreaming, persistedElapsedMs, persistedTokens, persistedToolCount, dynamicLabel }) => {
   const c = useClaudeTokens();
 
-  // Only time a think-session that we actually saw start live. For saved
-  // messages loaded from history, we don't have reliable start/end, so
-  // we fall back to a generic "Thoughts" label.
+  // Live timer is only used as a fallback when we don't yet have
+  // server-stamped persistedElapsedMs. The pill stays in "Thinking…"
+  // for the entire duration of a multi-block turn (think → tool →
+  // think → answer), and only swaps to "Thought for Ns · M tokens"
+  // once persistedElapsedMs lands via the agent:message event for
+  // role='thinking', which carries the per-turn aggregate (not the
+  // per-block stats the live UI used to freeze on prematurely).
   const [startedStreamingAt, setStartedStreamingAt] = useState<number | null>(
     isStreaming ? Date.now() : null
   );
   const [elapsed, setElapsed] = useState<number>(0);
-  const [frozenElapsed, setFrozenElapsed] = useState<number | null>(null);
 
   // Record start time the first time we see streaming
   React.useEffect(() => {
@@ -539,16 +545,15 @@ const ThinkingBubble: React.FC<{
     return () => clearInterval(iv);
   }, [isStreaming, startedStreamingAt]);
 
-  // Freeze elapsed when streaming ends
-  React.useEffect(() => {
-    if (!isStreaming && startedStreamingAt !== null && frozenElapsed === null) {
-      setFrozenElapsed(Math.max(1, Math.floor((Date.now() - startedStreamingAt) / 1000)));
-    }
-  }, [isStreaming, startedStreamingAt, frozenElapsed]);
-
-  // Always default to expanded — user can click to collapse
+  // Default behavior: expanded while streaming (so the user can watch
+  // the model think live), collapsed after the turn ends (so the
+  // transcript reads as answer-first, with reasoning available on click).
+  // userOverride captures explicit clicks and pins the state — once the
+  // user has chosen, we respect their pick across the streaming →
+  // post-stream transition. This avoids the wall-of-text problem where
+  // a 1.6K-token reasoning block stayed expanded after the turn finished.
   const [userOverride, setUserOverride] = useState<boolean | null>(null);
-  const expanded = userOverride ?? true;
+  const expanded = userOverride ?? !!isStreaming;
   const toggle = () => setUserOverride(!expanded);
 
   const text = typeof content === 'string' ? content : JSON.stringify(content);
@@ -558,13 +563,18 @@ const ThinkingBubble: React.FC<{
   const liveTokenEstimate = isStreaming ? Math.max(0, Math.round(text.length / 3.6)) : 0;
 
   // Post-stream label preference order:
-  //   1. Server-stamped persisted values (survive reload).
-  //   2. Live React-state values (set during this session's stream).
-  //   3. Generic "Thoughts" fallback for legacy messages with neither.
+  //   1. Server-stamped persisted values (per-turn aggregate, survives
+  //      reload — this is the truth source we actually want).
+  //   2. Live React-state elapsed (only used if server values are
+  //      missing, e.g. legacy messages).
+  //   3. Generic "Thoughts" fallback.
   const persistedSecs = persistedElapsedMs != null
     ? Math.max(1, Math.round(persistedElapsedMs / 1000))
     : null;
-  const finalSeconds = persistedSecs ?? frozenElapsed;
+  const finalSeconds = persistedSecs
+    ?? (startedStreamingAt != null && !isStreaming
+        ? Math.max(1, Math.floor((Date.now() - startedStreamingAt) / 1000))
+        : null);
   const finalTokens = persistedTokens
     ?? (text && !isStreaming ? Math.max(1, Math.round(text.length / 3.6)) : null);
 
@@ -577,15 +587,56 @@ const ThinkingBubble: React.FC<{
     ? (liveTokenEstimate > 0 ? `${dynamicLabel}… · ~${liveTokenEstimate} tokens` : `${dynamicLabel}…`)
     : (liveTokenEstimate > 0 ? `Thinking… (~${liveTokenEstimate} tokens)` : 'Thinking…');
 
-  const label = isStreaming
-    ? activeLabel
-    : finalSeconds != null
-      ? (finalTokens != null
-          ? `Thought for ${finalSeconds}s · ${finalTokens} tokens`
-          : `Thought for ${finalSeconds}s`)
-      : finalTokens != null
-        ? `Thoughts · ${finalTokens} tokens`
-        : 'Thoughts';
+  // Compact number formatter for the post-stream label — "2.4K" beats
+  // "2400" once token counts get large.
+  const fmtTokens = (n: number) => {
+    if (n >= 1000) {
+      const k = n / 1000;
+      return k >= 10 ? `${Math.round(k)}K` : `${k.toFixed(1)}K`;
+    }
+    return String(n);
+  };
+
+  // Duration formatter that rolls over at minute / hour boundaries so
+  // "Thought for 251s" reads as "Thought for 4m 11s" — same shape the
+  // header chip uses. Mirrors the AgentCard fmtSeconds helper but kept
+  // local so the bubble stays self-contained.
+  const fmtThoughtDuration = (sec: number) => {
+    if (sec < 60) return `${sec}s`;
+    const minutes = Math.floor(sec / 60);
+    if (minutes < 60) {
+      const remSec = sec % 60;
+      return remSec > 0 ? `${minutes}m ${remSec}s` : `${minutes}m`;
+    }
+    const hours = Math.floor(minutes / 60);
+    const remMin = minutes % 60;
+    return remMin > 0 ? `${hours}h ${remMin}m` : `${hours}h`;
+  };
+
+  // Post-stream label: "Thought for Ns · 32 tokens · 3 tools used".
+  // The reasoning-token count is the honest signal of how much thinking
+  // happened; tool count surfaces work done; duration surfaces wait time.
+  // We deliberately omit a separate "answer tokens" number — earlier
+  // experiments showed it confused users (it counted both visible reply
+  // text AND tool-call JSON arguments, making tool-heavy turns
+  // misleadingly look like long answers).
+  const buildPostStreamLabel = () => {
+    const parts: string[] = [];
+    if (finalSeconds != null) {
+      parts.push(`Thought for ${fmtThoughtDuration(finalSeconds)}`);
+    } else {
+      parts.push('Thoughts');
+    }
+    if (finalTokens != null) {
+      parts.push(`${fmtTokens(finalTokens)} tokens`);
+    }
+    if (persistedToolCount != null && persistedToolCount > 0) {
+      parts.push(`${persistedToolCount} tool${persistedToolCount === 1 ? '' : 's'} used`);
+    }
+    return parts.join(' · ');
+  };
+
+  const label = isStreaming ? activeLabel : buildPostStreamLabel();
 
   // Shimmer colors — use a bright mid-tone against the muted base to make
   // the sweep visible without being loud. The base color matches the
@@ -659,10 +710,62 @@ const ThinkingBubble: React.FC<{
             fontFamily: c.font.sans,
           }}
         >
-          {text}
-          {isStreaming && <StreamingCursor />}
+          {text ? (
+            <>
+              {text}
+              {isStreaming && <StreamingCursor />}
+            </>
+          ) : (
+            <ProviderReasoningExplanation
+              isStreaming={!!isStreaming}
+              tokens={persistedTokens ?? null}
+              elapsedMs={persistedElapsedMs ?? null}
+            />
+          )}
         </Box>
       </Collapse>
+    </Box>
+  );
+};
+
+// Friendly explanation rendered in the expanded Thinking pill body when
+// the model thought but didn't return any reasoning text. Keeps the user
+// informed about *why* the panel is empty rather than leaving them
+// staring at a blank box. Three cases:
+//   1. Live-streaming, no text yet → "Reasoning..." with cursor
+//   2. Done, has reasoning tokens → explain that text isn't exposed by
+//      the upstream provider but the model spent N tokens / Ms thinking
+//   3. Done, no signal at all → say so honestly
+const ProviderReasoningExplanation: React.FC<{
+  isStreaming: boolean;
+  tokens: number | null;
+  elapsedMs: number | null;
+}> = ({ isStreaming, tokens, elapsedMs }) => {
+  if (isStreaming) {
+    return (
+      <Box component="span" sx={{ fontStyle: 'italic', opacity: 0.85 }}>
+        Reasoning…
+        <StreamingCursor />
+      </Box>
+    );
+  }
+  const hasMetrics = (tokens && tokens > 0) || (elapsedMs && elapsedMs > 0);
+  const metric = (() => {
+    if (!hasMetrics) return null;
+    const segs: string[] = [];
+    if (elapsedMs && elapsedMs > 0) {
+      segs.push(`${Math.max(1, Math.round(elapsedMs / 1000))}s`);
+    }
+    if (tokens && tokens > 0) {
+      segs.push(`${tokens.toLocaleString()} reasoning tokens`);
+    }
+    return segs.join(' · ');
+  })();
+  return (
+    <Box component="span" sx={{ fontStyle: 'italic', opacity: 0.85 }}>
+      The model reasoned about this turn, but the provider didn't expose
+      the reasoning text — only Anthropic emits a full chain-of-thought
+      stream. {metric ? `Spent ${metric} thinking.` : 'No reasoning trace available.'}
     </Box>
   );
 };
@@ -702,6 +805,7 @@ const MessageBubble: React.FC<Props> = React.memo(({ message, editing = false, o
         timestamp={message.timestamp}
         persistedElapsedMs={(message as any).elapsed_ms}
         persistedTokens={(message as any).tokens}
+        persistedToolCount={(message as any).tool_count}
         dynamicLabel={isStreaming ? dynamicTurnLabel : null}
       />
     );
