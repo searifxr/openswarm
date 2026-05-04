@@ -120,6 +120,14 @@ class AgentSession(BaseModel):
     browser_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     needs_fork: bool = False
+    # Stronger than needs_fork: when True, the next turn drops `resume=`
+    # entirely and replays history into a brand-new sdk_session_id. This
+    # is the only way to make the bundled CLI re-read mcp_servers from
+    # the rebuilt options dict — `fork_session=True` only forks the
+    # conversation tree, it inherits the original transport's MCP server
+    # set. Set after MCPActivate when prior turns exist so the newly
+    # activated server's tools actually reach the model.
+    needs_fresh_session: bool = False
     # Set when MCPActivate (or analogous activation) wants the agent to
     # auto-continue immediately after the current turn ends — without
     # requiring the user to type another message. The agent loop reads

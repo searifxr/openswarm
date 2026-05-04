@@ -375,6 +375,7 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
   }, []);
 
   const scrollRafRef = useRef<number | null>(null);
+  const lastScrollHeightRef = useRef<number>(0);
   useEffect(() => {
     if (!isAtBottomRef.current) return;
     if (scrollRafRef.current != null) return;
@@ -382,7 +383,19 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
       scrollRafRef.current = null;
       if (!isAtBottomRef.current) return;
       const el = scrollContainerRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
+      if (!el) return;
+      // Only set scrollTop when the scrollable height actually grew.
+      // Otherwise we're forcing a paint for nothing — and on a
+      // streaming turn we get one of these per delta, which thrashes
+      // the compositor for zero visible benefit. The native
+      // overflow-anchor on the container already keeps the viewport
+      // pinned to the bottom; this JS fallback only needs to handle
+      // the rare case where anchoring misses (legacy WebKit,
+      // virtualized children, dynamic-height inserts).
+      const newHeight = el.scrollHeight;
+      if (newHeight === lastScrollHeightRef.current) return;
+      lastScrollHeightRef.current = newHeight;
+      el.scrollTop = newHeight;
     });
   }, [session?.messages.length, session?.streamingMessage?.content]);
 
@@ -895,6 +908,23 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
               overflow: 'auto',
               px: 2,
               py: 1,
+              // Smoothness bundle (perf-only — no behavior change):
+              //   1. overflow-anchor: auto — Chromium's native scroll
+              //      anchoring keeps the viewport pinned to the user's
+              //      visible content as siblings above/below resize.
+              //      Eliminates the "transcript snaps back" feel during
+              //      streaming and parallel tool fan-outs. Runs on the
+              //      compositor thread, free.
+              //   2. contain: layout — tells the browser layout shifts
+              //      inside this scroll container don't affect siblings
+              //      outside it. Prevents reflow from cascading up to
+              //      the dashboard layout when bubbles grow.
+              //   3. overscroll-behavior: contain — keeps over-scroll
+              //      gestures from leaking up to the dashboard pan/zoom
+              //      when the user hits the chat top/bottom.
+              overflowAnchor: 'auto',
+              contain: 'layout',
+              overscrollBehavior: 'contain',
               '&::-webkit-scrollbar': { width: 6 },
               '&::-webkit-scrollbar-track': { background: 'transparent' },
               '&::-webkit-scrollbar-thumb': {

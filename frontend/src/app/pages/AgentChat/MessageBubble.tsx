@@ -984,6 +984,12 @@ const MessageBubble: React.FC<Props> = React.memo(({ message, editing = false, o
         display: 'flex',
         justifyContent: isUser ? 'flex-end' : 'flex-start',
         my: 0.75,
+        // Layout-style containment: any reflow inside this bubble (text
+        // wrapping during streaming, tooltip popup, expand/collapse)
+        // doesn't propagate to siblings. Without this, every delta in
+        // a long assistant message reflowed the entire transcript.
+        // Browser support is universal in modern Chromium/WebKit.
+        contain: 'layout style',
       }}
     >
       <Box

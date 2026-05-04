@@ -96,7 +96,16 @@ const ToolGroupBubble: React.FC<Props> = React.memo(({ group, isSessionRunning =
       data-select-type="tool-group"
       data-select-id={group.id}
       data-select-meta={JSON.stringify({ label: displayName, callCount: group.callCount, tools: toolNames })}
-      sx={{ maxWidth: '85%', my: 0.5 }}
+      sx={{
+        maxWidth: '85%',
+        my: 0.5,
+        // Layout containment: tool rows inserting inside this group
+        // don't reflow the rest of the transcript. The header chip
+        // count tabular-nums fix already handles the within-row
+        // jitter; this stops the OUTER scroll container from
+        // re-laying-out every other bubble when a new row appears.
+        contain: 'layout style',
+      }}
     >
       <Box
         sx={{
@@ -188,7 +197,22 @@ const ToolGroupBubble: React.FC<Props> = React.memo(({ group, isSessionRunning =
         </Box>
 
         <Collapse in={expanded}>
-          <Box sx={{ borderTop: `0.5px solid ${c.border.medium}` }}>
+          <Box
+            sx={{
+              borderTop: `0.5px solid ${c.border.medium}`,
+              // Each tool row fades in over 140ms when inserted, instead
+              // of jumping into place. Pure CSS — runs on the compositor
+              // and pairs with the parent's contain:layout so the rest
+              // of the transcript doesn't shift while the row settles.
+              '& > *': {
+                animation: 'toolRowFadeIn 140ms ease-out',
+              },
+              '@keyframes toolRowFadeIn': {
+                from: { opacity: 0, transform: 'translateY(-2px)' },
+                to: { opacity: 1, transform: 'translateY(0)' },
+              },
+            }}
+          >
             {group.pairs.map((pair) => (
               <ToolCallBubble
                 key={pair.id}
