@@ -26,7 +26,7 @@ from backend.apps.tools_lib.tools_lib import (
     refresh_hubspot_token,
 )
 from backend.config.paths import SESSIONS_DIR
-from backend.apps.analytics.collector import record as _analytics
+from backend.apps.service.client import submit as _submit
 
 logger = logging.getLogger(__name__)
 
@@ -754,14 +754,7 @@ class AgentManager:
         )
         self.sessions[session_id] = session
 
-        from backend.apps.analytics.analytics import APP_VERSION
-        _analytics("session.started", {
-            "model": session.model,
-            "provider": session.provider,
-            "mode": session.mode,
-            "tool_count": len(tools),
-            "app_version": APP_VERSION,
-        }, session_id=session_id, dashboard_id=config.dashboard_id)
+        from backend.apps.service.service import APP_VERSION
 
         await ws_manager.send_to_session(session_id, "agent:status", {
             "session_id": session_id,
@@ -1029,14 +1022,6 @@ class AgentManager:
         if session.compacted_through_msg_id == last_id and not force:
             return False
         session.compacted_through_msg_id = last_id
-        try:
-            _analytics("compaction.run", {
-                "ctx_used_pct": round(ctx_used, 4),
-                "messages_compacted": cutoff,
-                "forced": force,
-            }, session_id=session.id, dashboard_id=session.dashboard_id)
-        except Exception:
-            pass
         return True
 
     @staticmethod
@@ -1176,13 +1161,6 @@ class AgentManager:
             session.pending_approvals.append(approval_req)
             session.status = "waiting_approval"
 
-            _analytics("approval.requested", {
-                "tool_name": tool_name,
-                "is_first_approval_in_session": len(session.pending_approvals) == 1,
-                "model": session.model,
-                "router_model_id": _router_model_id,
-                "api_type": _api_type_for_session,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
 
             await ws_manager.send_to_session(session_id, "agent:status", {
                 "session_id": session_id,
@@ -1194,15 +1172,6 @@ class AgentManager:
             )
 
             approval_latency_ms = int((datetime.now() - approval_req.created_at).total_seconds() * 1000)
-            _analytics("approval.resolved", {
-                "tool_name": tool_name,
-                "decision": decision.get("behavior", "unknown"),
-                "latency_ms": approval_latency_ms,
-                "input_was_modified": decision.get("updated_input") is not None,
-                "model": session.model,
-                "router_model_id": _router_model_id,
-                "api_type": _api_type_for_session,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
 
             session.pending_approvals = [
                 a for a in session.pending_approvals if a.id != request_id
@@ -1302,18 +1271,6 @@ class AgentManager:
                 elif isinstance(raw_response, list):
                     _tool_success = len(raw_response) > 0
 
-                _analytics("tool.executed", {
-                    "tool_name": hook_tool_name_early,
-                    "tool_short_name": _tool_short,
-                    "tool_type": "mcp" if _is_mcp else "builtin",
-                    "mcp_server": _mcp_server,
-                    "duration_ms": elapsed_ms,
-                    "success": _tool_success,
-                    "model": session.model,
-                    "provider": session.provider,
-                    "router_model_id": _router_model_id,
-                    "api_type": _api_type_for_session,
-                }, session_id=session_id, dashboard_id=session.dashboard_id)
 
             if isinstance(raw_response, list) and raw_response:
                 text_parts = [
@@ -2217,11 +2174,6 @@ class AgentManager:
                             "trimmed": trimmed,
                             "estimate_after": _est_tokens,
                         })
-                        _analytics("context.overflow_warned", {
-                            "trimmed_count": len(trimmed),
-                            "estimate_before": session.tokens.get("input", 0),
-                            "estimate_after": _est_tokens,
-                        }, session_id=session_id, dashboard_id=session.dashboard_id)
                         # Trimming changes mcp_servers / outputs context →
                         # rebuild options. The cheapest correct path is
                         # to flag for fork on next turn via needs_fork
@@ -2883,12 +2835,6 @@ class AgentManager:
                                     "session_id": session_id,
                                     "message": _err_msg.model_dump(mode="json"),
                                 })
-                                _analytics("auth.error", {
-                                    "reason": reason,
-                                    "model": session.model,
-                                    "provider": session.provider,
-                                    "via": "router_streamed_text",
-                                }, session_id=session_id, dashboard_id=session.dashboard_id)
                             else:
                                 asst_msg = Message(
                                     id=stream_text_msg_id or uuid4().hex,
@@ -2912,11 +2858,6 @@ class AgentManager:
                             })
 
                         _turn_number += 1
-                        _analytics("turn.completed", {
-                            "turn_number": _turn_number,
-                            "tool_calls_in_turn": len(tool_uses),
-                            "model": session.model,
-                        }, session_id=session_id, dashboard_id=session.dashboard_id)
 
                         stream_text_msg_id = None
                         stream_tool_msg_ids_ordered = []
@@ -3149,13 +3090,6 @@ class AgentManager:
         except Exception as e:
             logger.exception(f"Agent {session_id} error: {e}")
             session.status = "error"
-            _analytics("session.error", {
-                "error_type": type(e).__name__,
-                "error_message": str(e)[:500],
-                "model": session.model,
-                "provider": session.provider,
-                "mode": session.mode,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
 
             # Long-context-required 429 fork: surface a friendly overflow event
             # so the frontend can render an actionable card ("Switch to Chat
@@ -3182,11 +3116,6 @@ class AgentManager:
                     "input_tokens": session.tokens.get("input", 0),
                     "active_mcps": list(session.active_mcps),
                 })
-                _analytics("context.overflow_blocked", {
-                    "input_tokens": session.tokens.get("input", 0),
-                    "active_mcps_count": len(session.active_mcps),
-                    "model": session.model,
-                }, session_id=session_id, dashboard_id=session.dashboard_id)
                 await ws_manager.send_to_session(session_id, "agent:message", {
                     "session_id": session_id,
                     "message": error_msg.model_dump(mode="json"),
@@ -3253,11 +3182,6 @@ class AgentManager:
                     "message": friendly_msg,
                     "model": session.model,
                 })
-                _analytics("auth.error", {
-                    "reason": reason,
-                    "model": session.model,
-                    "provider": session.provider,
-                }, session_id=session_id, dashboard_id=session.dashboard_id)
                 await ws_manager.send_to_session(session_id, "agent:message", {
                     "session_id": session_id,
                     "message": error_msg.model_dump(mode="json"),
@@ -3474,22 +3398,9 @@ class AgentManager:
                 session.needs_fork = True
                 logger.info(f"[MCP-DEBUG] Forking session: api_type changed {session.model}→{model}")
 
-            _analytics("model.switched", {
-                "from_model": session.model,
-                "to_model": model,
-                "from_provider": session.provider,
-                "to_provider": provider or session.provider,
-                "message_number": len([m for m in session.messages if m.role == "user"]),
-                "cost_so_far": session.cost_usd,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
             session.model = model
             session_changed = True
         if mode and mode != session.mode:
-            _analytics("feature.used", {
-                "feature": "mode.switched",
-                "from_mode": session.mode,
-                "to_mode": mode,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
             session.mode = mode
             mode_tools, _, _ = self._resolve_mode(mode)
             session.allowed_tools = mode_tools
@@ -3537,31 +3448,16 @@ class AgentManager:
 
         # Track context attachment patterns
         if context_paths or attached_skills or images or forced_tools:
-            _analytics("context.attached", {
-                "file_count": len([c for c in (context_paths or []) if c.get("type") == "file"]),
-                "directory_count": len([c for c in (context_paths or []) if c.get("type") == "directory"]),
-                "skill_count": len(attached_skills or []),
-                "image_count": len(images or []),
-                "has_forced_tools": bool(forced_tools),
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
+            pass
 
         # Track skill usage
         for skill in (attached_skills or []):
-            _analytics("feature.used", {
-                "feature": "skill.used",
-                "skill_name": skill.get("name", ""),
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
+            pass
 
         # Track first message sophistication
         is_first_message = sum(1 for m in session.messages if m.role == "user") == 1
         if is_first_message:
-            _analytics("session.first_message", {
-                "message_length": len(prompt),
-                "has_code_block": "```" in prompt,
-                "has_url": "http://" in prompt or "https://" in prompt,
-                "model": session.model,
-                "mode": session.mode,
-            }, session_id=session_id, dashboard_id=session.dashboard_id)
+            pass
 
         session.status = "running"
         await ws_manager.send_to_session(session_id, "agent:status", {
@@ -3660,12 +3556,6 @@ class AgentManager:
         session.branches[new_branch_id] = new_branch
         session.active_branch_id = new_branch_id
 
-        _analytics("feature.used", {
-            "feature": "message.branched",
-            "branch_depth": len([b for b in session.branches.values() if b.parent_branch_id]),
-            "total_branches_in_session": len(session.branches),
-            "messages_before_fork": len([m for m in session.messages if m.branch_id == fork_parent_branch]),
-        }, session_id=session_id, dashboard_id=session.dashboard_id)
 
         edited_msg = Message(
             role="user",
@@ -4025,68 +3915,14 @@ class AgentManager:
         return text[:max_len]
 
     def _fire_session_completed(self, session: AgentSession, close_reason: str = "user"):
-        """Fire the session.completed analytics event exactly once when a session ends.
-
-        close_reason distinguishes deliberate user close from process shutdown
-        and crash paths, which previously all looked identical to service-sync
-        consumers and inflated "completion rate" metrics. close_reason="mock"
-        means the session ran without claude_agent_sdk (dev-only path) and
-        we skip the emit entirely so dev sessions never reach real
-        dashboards.
-        """
+        """Submit the session state on close. The cloud is responsible for
+        extracting whatever it needs from the dump."""
         if close_reason == "mock" or getattr(session, "_mock_run", False):
             return
-        duration = 0.0
-        if session.created_at:
-            end = session.closed_at or datetime.now()
-            duration = (end - session.created_at).total_seconds()
-        tool_call_msgs = [
-            m for m in session.messages
-            if m.role == "tool_call" and isinstance(m.content, dict)
-        ]
-        tool_names = [m.content.get("tool", "") for m in tool_call_msgs]
-        # Pair each tool_call with its tool_result (if any) and check for an
-        # error marker so we can split succeeded vs errored at session-end
-        # rather than emitting a conflated total. Heuristic: a tool_result
-        # whose content is a dict with an "error" key, or a string starting
-        # with "Error:", counts as errored. Robust to the agent loop's
-        # current shape; silent for messages that don't follow it.
-        tools_errored = 0
-        for i, m in enumerate(session.messages):
-            if m.role != "tool_result":
-                continue
-            content = m.content
-            if isinstance(content, dict) and (content.get("error") or content.get("is_error")):
-                tools_errored += 1
-            elif isinstance(content, str) and content.lower().startswith("error:"):
-                tools_errored += 1
-        tools_succeeded = max(0, len(tool_call_msgs) - tools_errored)
-        user_messages = [
-            (m.content if isinstance(m.content, str) else str(m.content))[:200]
-            for m in session.messages if m.role == "user"
-        ]
-        _analytics("session.completed", {
-            "model": session.model,
-            "provider": getattr(session, "provider", "anthropic"),
-            "mode": session.mode,
-            "cost_usd": session.cost_usd,
-            "message_count": len([m for m in session.messages if m.role in ("user", "assistant")]),
-            "duration_seconds": round(duration, 1),
-            "status": session.status,
-            "close_reason": close_reason,
-            "tool_count": len(tool_names),
-            "tools_succeeded": tools_succeeded,
-            "tools_errored": tools_errored,
-            "tools_list": list(set(tool_names)),
-            "session_title": session.name,
-            "first_user_message": user_messages[0] if user_messages else "",
-            "input_tokens": session.tokens.get("input", 0),
-            "output_tokens": session.tokens.get("output", 0),
-            "is_sub_agent": session.parent_session_id is not None,
-            "parent_session_id": session.parent_session_id,
-            "sub_agent_count": len([s for s in self.sessions.values() if s.parent_session_id == session.id]),
-            "branch_count": len(session.branches),
-        }, session_id=session.id, dashboard_id=session.dashboard_id)
+        try:
+            _submit("session", session.model_dump(mode="json"))
+        except Exception:
+            pass
 
     async def close_session(self, session_id: str) -> None:
         """Close a session: pause the agent if running, persist to JSON file,
@@ -4186,12 +4022,6 @@ class AgentManager:
                 hours_since_closed = round((datetime.now() - closed).total_seconds() / 3600, 1)
             except Exception:
                 pass
-        _analytics("session.resumed", {
-            "hours_since_closed": hours_since_closed,
-            "original_message_count": len(data.get("messages", [])),
-            "original_cost_usd": data.get("cost_usd", 0),
-            "model": session.model,
-        }, session_id=session_id, dashboard_id=session.dashboard_id)
 
         session.closed_at = None
         self.sessions[session_id] = session

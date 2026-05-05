@@ -57,7 +57,7 @@ def _sync_subscription_identity(settings_obj) -> None:
     paying-vs-free. Safe to call from hot paths — service-sync is fire-and-forget
     and swallows errors internally."""
     try:
-        from backend.apps.analytics.collector import identify as _identify
+        from backend.apps.service.client import identify as _identify
     except Exception:
         return
     mode = getattr(settings_obj, "connection_mode", "own_key")
@@ -233,14 +233,14 @@ async def sync():
     already had."""
     # Lazy-import the service-sync helper so subscription/router doesn't pay the
     # cost when analytics are disabled.
-    from backend.apps.analytics.collector import record as _record
+    from backend.apps.service.client import submit as _submit
 
     settings_obj = load_settings()
     bearer = getattr(settings_obj, "openswarm_bearer_token", None)
     mode = getattr(settings_obj, "connection_mode", "own_key")
 
     if mode != "openswarm-pro" or not bearer:
-        _record("subscription.sync_ran", {"reason": "no_bearer"})
+        _submit("event", {"reason": "no_bearer"})
         return {"ok": True, "synced": False, "connection_mode": mode}
 
     try:
@@ -251,7 +251,7 @@ async def sync():
             )
     except httpx.HTTPError as e:
         logger.debug("subscription/sync live fetch failed: %s", e)
-        _record("subscription.sync_ran", {"reason": "network"})
+        _submit("event", {"reason": "network"})
         return {"ok": True, "synced": False, "reason": "network"}
 
     # Same 401/402 handling as /status: if Stripe-side reconciliation proves
@@ -260,7 +260,7 @@ async def sync():
     if r.status_code in (401, 402):
         await _clear_subscription(settings_obj)
         reason = "revoked" if r.status_code == 401 else "expired"
-        _record("subscription.sync_ran", {"reason": reason})
+        _submit("event", {"reason": reason})
         return {
             "ok": True,
             "synced": False,
@@ -270,7 +270,7 @@ async def sync():
 
     if r.status_code != 200:
         logger.debug("subscription/sync got %s from cloud: %s", r.status_code, r.text[:200])
-        _record("subscription.sync_ran", {"reason": "upstream", "status_code": r.status_code})
+        _submit("event", {"reason": "upstream", "status_code": r.status_code})
         return {"ok": True, "synced": False, "reason": "upstream"}
 
     data = r.json()
@@ -288,7 +288,7 @@ async def sync():
         )
     await save_settings_async(settings_obj)
     _sync_subscription_identity(settings_obj)
-    _record("subscription.sync_ran", {
+    _submit("event", {
         "reason": "ok",
         "synced": bool(data.get("synced")),
         "plan": cloud_plan,

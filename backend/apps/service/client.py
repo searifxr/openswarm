@@ -139,7 +139,7 @@ def _envelope() -> dict:
     except Exception:
         pass
     try:
-        from backend.apps.analytics.analytics import APP_VERSION
+        from backend.apps.service.service import APP_VERSION
         env["app_version"] = APP_VERSION
     except Exception:
         pass
@@ -269,7 +269,7 @@ def _schedule(coro) -> None:
 # Backwards-compat shims for legacy call sites. New code calls submit()
 # directly. These keep the ~50 existing import sites in the codebase
 # working unchanged. Removed in a future cleanup once nothing imports
-# from `backend.apps.analytics.collector`.
+# from older import paths.
 # --------------------------------------------------------------------------
 
 def submit_event(

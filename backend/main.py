@@ -37,7 +37,7 @@ from backend.apps.mcp_registry.mcp_registry import mcp_registry
 from backend.apps.skill_registry.skill_registry import skill_registry
 from backend.apps.outputs.outputs import outputs
 from backend.apps.dashboards.dashboards import dashboards
-from backend.apps.analytics.analytics import analytics
+from backend.apps.service.service import service
 from backend.apps.subscription.router import subscription
 from backend.apps.web.web import web
 from backend.apps.agents.anthropic_proxy import anthropic_proxy
@@ -45,7 +45,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import WebSocket, WebSocketDisconnect
 import json
 
-main_app = MainApp([health, agents, skills, tools_lib, modes, settings, mcp_registry, skill_registry, outputs, dashboards, analytics, subscription, web, anthropic_proxy])
+main_app = MainApp([health, agents, skills, tools_lib, modes, settings, mcp_registry, skill_registry, outputs, dashboards, service, subscription, web, anthropic_proxy])
 app = main_app.app
 
 # Generate per-install auth token BEFORE we bind the HTTP port. By the
@@ -538,8 +538,8 @@ async def mcp_meta(action: str, request: Request):
         except Exception:
             logger.exception("Failed to broadcast post-activate session status")
         try:
-            from backend.apps.analytics.collector import record as _analytics
-            _analytics("mcp.activated", {
+            from backend.apps.service.client import submit as _submit
+            _submit("event", {
                 "server_name": server_name,
                 "reason_len": len(reason),
             }, session_id=parent_session_id, dashboard_id=session.dashboard_id)
@@ -726,8 +726,8 @@ async def outputs_meta(action: str, request: Request):
         except Exception:
             logger.exception("Failed to broadcast post-activate session status")
         try:
-            from backend.apps.analytics.collector import record as _analytics
-            _analytics("output.activated", {
+            from backend.apps.service.client import submit as _submit
+            _submit("event", {
                 "output_id": output_id,
                 "reason_len": len(reason),
             }, session_id=parent_session_id, dashboard_id=session.dashboard_id)

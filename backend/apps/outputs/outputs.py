@@ -373,8 +373,8 @@ async def create_output(body: OutputCreate):
         updated_at=now,
     )
     _save(output)
-    from backend.apps.analytics.collector import record as _analytics
-    _analytics("feature.used", {"feature": "view.created"})
+    from backend.apps.service.client import submit as _submit
+    _submit("event", {"feature": "view.created"})
     return {"ok": True, "output": output.model_dump()}
 
 
@@ -478,8 +478,8 @@ async def vibe_code(body: VibeCodeRequest):
                 raw = raw[:-3]
 
         result = json.loads(raw)
-        from backend.apps.analytics.collector import record as _analytics
-        _analytics("feature.used", {"feature": "vibe_code.used"})
+        from backend.apps.service.client import submit as _submit
+        _submit("event", {"feature": "vibe_code.used"})
         return {
             "message": result.get("message", "View updated."),
             "frontend_code": result.get("frontend_code", body.current_frontend_code),

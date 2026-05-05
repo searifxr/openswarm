@@ -163,8 +163,8 @@ async def create_skill(body: SkillCreate):
         file_path=fpath,
         command=body.command or slug,
     )
-    from backend.apps.analytics.collector import record as _analytics
-    _analytics("feature.used", {"feature": "skill.created"})
+    from backend.apps.service.client import submit as _submit
+    _submit("event", {"feature": "skill.created"})
     return {"ok": True, "skill": skill.model_dump()}
 
 

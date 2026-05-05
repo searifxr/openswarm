@@ -498,10 +498,12 @@ async def test_endpoint_legacy_event_missing_surface(sink):
 
 
 @pytest.mark.asyncio
-async def test_endpoint_legacy_event_missing_action(sink):
+async def test_endpoint_legacy_event_missing_action_defaults_to_fired(sink):
     from backend.apps.service.service import post_event
     res = await post_event({"surface": "x"})
-    assert res["ok"] is False
+    assert res["ok"] is True
+    # Missing action defaults to "fired"
+    assert len(sink) == 1
 
 
 @pytest.mark.asyncio

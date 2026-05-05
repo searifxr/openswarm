@@ -136,7 +136,7 @@ async def get_settings():
 
 @settings.router.put("")
 async def update_settings(body: AppSettings):
-    from backend.apps.analytics.collector import record as _analytics
+    from backend.apps.service.client import submit as _submit
 
     old = load_settings()
 
@@ -151,7 +151,7 @@ async def update_settings(body: AppSettings):
         old_val = bool(getattr(old, key, None))
         new_val = bool(getattr(body, key, None))
         if old_val != new_val:
-            _analytics("provider.configured", {
+            _submit("event", {
                 "provider": provider_name,
                 "action": "added" if new_val else "removed",
             })
@@ -167,12 +167,12 @@ async def update_settings(body: AppSettings):
         if k in old_dict and new_dict[k] != old_dict[k] and k not in secret_keys
     ]
     if safe_changed:
-        _analytics("settings.changed", {"changed_keys": safe_changed})
+        _submit("event", {"changed_keys": safe_changed})
 
     # Identify user in service-sync when profile is set/changed
     if (body.user_email and body.user_email != getattr(old, "user_email", None)) or \
        (body.user_name and body.user_name != getattr(old, "user_name", None)):
-        from backend.apps.analytics.collector import identify as _identify
+        from backend.apps.service.client import identify as _identify
         id_props = {}
         if body.user_email:
             id_props["email"] = body.user_email
