@@ -1,7 +1,7 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import { API_BASE } from '@/shared/config';
 
-const ANALYTICS_API = `${API_BASE}/analytics`;
+const ANALYTICS_API = `${API_BASE}/service`;
 
 export interface UsageSummary {
   total_sessions: number;

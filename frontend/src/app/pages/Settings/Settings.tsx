@@ -922,7 +922,7 @@ const UsageStats: React.FC = () => {
   const [stats, setStats] = useState<any>(null);
 
   useEffect(() => {
-    fetch(`${API_BASE}/analytics/usage-summary`)
+    fetch(`${API_BASE}/service/usage-summary`)
       .then(r => r.json())
       .then(setStats)
       .catch(() => {});
