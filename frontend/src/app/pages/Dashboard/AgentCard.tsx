@@ -615,7 +615,19 @@ const AgentCard: React.FC<Props> = ({
       data-select-type="agent-card"
       data-select-id={session.id}
       data-select-meta={JSON.stringify({ name: session.name || session.id, status: session.status, model: session.model, mode: session.mode })}
-      
+      // Onboarding tiebreaker: when the user has multiple agent cards open
+      // (e.g. step 5 leaves the YouTube-summary agent on canvas while
+      // step 6 spawns a new orchestrator), per-agent selectors like
+      // chat-input need a way to identify the NEWEST card. Object.values
+      // iteration order in Dashboard.tsx is keyed by session.id and not
+      // monotonic by creation time, so DOM order can't be trusted.
+      // ISO date parses cleanly to ms; missing values fall through to the
+      // last-DOM-node fallback in resolveSelector.
+      data-onboarding-spawn-ms={
+        session.created_at
+          ? new Date(session.created_at).getTime() || undefined
+          : undefined
+      }
       onClick={(e: React.MouseEvent) => {
         if (justDraggedRef.current) return;
         onCardSelect?.(session.id, 'agent', e.shiftKey);

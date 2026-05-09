@@ -619,6 +619,7 @@ const AppShell: React.FC = () => {
           <Box sx={{ px: 1, mb: 0.25 }}>
             <ListItemButton
               onClick={handleDashboardsClick}
+              data-onboarding="sidebar-dashboards"
               sx={{
                 borderRadius: 1.5,
                 py: 0.6,
@@ -684,12 +685,20 @@ const AppShell: React.FC = () => {
                   scrollbarColor: `${c.border.medium} transparent`,
                 }}
               >
-                {dashboardList.map((entry) => {
+                {dashboardList.map((entry, idx) => {
                   const isActive = activeDashboardId === entry.id;
                   const isRenaming = renamingDashboardId === entry.id;
                   return (
                     <Box
                       key={entry.id}
+                      // Onboarding targets: every row carries a stable id so
+                      // the AC can point at a specific dashboard, plus the
+                      // first row gets a generic "first" alias so the AC
+                      // can teach "click into a dashboard" without knowing
+                      // any specific id.
+                      data-onboarding={
+                        idx === 0 ? 'dashboard-row-first' : `dashboard-row-${entry.id}`
+                      }
                       onClick={() => handleDashboardItemClick(entry.id)}
                       sx={{
                         display: 'flex',
@@ -982,6 +991,7 @@ const AppShell: React.FC = () => {
         >
           <ListItemButton
             onClick={() => dispatch(openSettingsModal())}
+            data-onboarding="sidebar-settings-button"
             sx={{
               borderRadius: 1.5,
               py: 0.6,

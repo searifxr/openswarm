@@ -41,6 +41,7 @@ import CodeEditor from './CodeEditor';
 import { ElementSelectionProvider } from '@/app/components/ElementSelectionContext';
 import { captureViewThumbnail } from './captureViewThumbnail';
 import { API_BASE } from '@/shared/config';
+import { onboardingBus } from '@/app/components/Onboarding/eventBus';
 
 const WORKSPACE_API = `${API_BASE}/outputs/workspace`;
 const POLL_INTERVAL_MS = 2000;
@@ -868,6 +869,11 @@ const ViewEditor: React.FC<Props> = ({ output, onClose }) => {
         savedId = created.id;
         createdIdRef.current = savedId;
         setCreatedId(savedId);
+        // First successful create = the App Builder agent finished
+        // generating an app. Step 8's "wait for app to land" listens for
+        // this. Subsequent saves don't fire — only the initial creation
+        // matters for onboarding.
+        onboardingBus.emit('app:generation_done');
       }
       savedRef.current = true;
       setSaveStatus('saved');
@@ -1144,6 +1150,13 @@ const ViewEditor: React.FC<Props> = ({ output, onClose }) => {
     <Box sx={{ height: '100%', display: 'flex', overflow: 'hidden' }}>
       {/* Left panel — AgentChat */}
       <Box
+        // data-onboarding-scope="app-builder" — the AC's per-agent
+        // selector resolver prefers this scope when it's mounted, so
+        // step 8's chat-input / chat-send-button / type_into all
+        // resolve inside the App Builder's AgentChat instance instead
+        // of falling through to whatever chat-input was last in DOM
+        // order (which led to AC typing into nothing visible).
+        data-onboarding-scope="app-builder"
         sx={{
           width: sidebarWidth,
           flexShrink: 0,
@@ -1284,6 +1297,7 @@ const ViewEditor: React.FC<Props> = ({ output, onClose }) => {
             onClick={() => handleSave(false)}
             disabled={saving || !name.trim()}
             size="small"
+            data-onboarding="app-builder-submit"
             sx={{
               bgcolor: c.accent.primary,
               textTransform: 'none',
@@ -1626,15 +1640,17 @@ const ViewEditor: React.FC<Props> = ({ output, onClose }) => {
                     <Typography sx={{ color: c.text.ghost, fontSize: '0.8rem', lineHeight: 1.6, flexShrink: 0 }}>
                       Describe what data to generate for this app. When triggered, an LLM will produce input data matching your schema and populate the preview.
                     </Typography>
-                    <ChatInput
-                      ref={autoRunInputRef}
-                      autoRunMode
-                      onSend={() => {}}
-                      mode={autoRunMode}
-                      onModeChange={setAutoRunMode}
-                      model={autoRunModel}
-                      onModelChange={setAutoRunModel}
-                    />
+                    <Box data-onboarding="app-builder-input" sx={{ width: '100%' }}>
+                      <ChatInput
+                        ref={autoRunInputRef}
+                        autoRunMode
+                        onSend={() => {}}
+                        mode={autoRunMode}
+                        onModeChange={setAutoRunMode}
+                        model={autoRunModel}
+                        onModelChange={setAutoRunModel}
+                      />
+                    </Box>
                     <Button
                       variant="contained"
                       startIcon={saving ? <CircularProgress size={14} color="inherit" /> : <SaveIcon sx={{ fontSize: 16 }} />}

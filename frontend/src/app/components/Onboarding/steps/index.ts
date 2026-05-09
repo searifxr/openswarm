@@ -1,0 +1,29 @@
+import type { OnboardingStep, StepStage } from './types';
+import { step01 } from './step01_connectModel';
+import { step02 } from './step02_enableActions';
+import { step03 } from './step03_launchAgent';
+import { step04 } from './step04_useBrowser';
+import { step05 } from './step05_agentUseBrowser';
+import { step06 } from './step06_agentControlAgents';
+import { step07 } from './step07_installSkill';
+import { step08 } from './step08_makeApp';
+
+export const STEPS: OnboardingStep[] = [
+  step01,
+  step02,
+  step03,
+  step04,
+  step05,
+  step06,
+  step07,
+  step08,
+];
+
+export function findStepById(id: string): OnboardingStep | undefined {
+  return STEPS.find((s) => s.id === id);
+}
+
+export const STAGE_GROUPS: { stage: StepStage; steps: OnboardingStep[] }[] = [
+  { stage: 'get_started', steps: STEPS.filter((s) => s.stage === 'get_started') },
+  { stage: 'learn_features', steps: STEPS.filter((s) => s.stage === 'learn_features') },
+];

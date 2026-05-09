@@ -408,7 +408,16 @@ const DashboardToolbar = React.forwardRef<HTMLDivElement, Props>(
         }}
       >
         {inputOpen ? (
-          <div style={{ width: '100%', minHeight: 56, paddingBottom: 0, marginBottom: -4 }}>
+          // data-onboarding-scope="dock" lets the AC's per-agent-selector
+          // resolver prefer this chat input (the new-agent dock that
+          // appears after clicking +) over any existing agent-card's
+          // chat input. Without this, AC would route to the most
+          // recently-spawned agent-card, which is usually the wrong
+          // target on step 5/6 (where the "new agent" is the dock draft).
+          <div
+            data-onboarding-scope="dock"
+            style={{ width: '100%', minHeight: 56, paddingBottom: 0, marginBottom: -4 }}
+          >
             <ChatInput
               onSend={handleSend}
               mode={mode}
@@ -695,6 +704,7 @@ const DashboardToolbar = React.forwardRef<HTMLDivElement, Props>(
                 aria-label="Add View"
                 tabIndex={0}
                 onClick={handleOpenViewPicker}
+                data-onboarding="dashboard-toolbar-apps"
                 sx={{
                   display: 'flex',
                   alignItems: 'center',

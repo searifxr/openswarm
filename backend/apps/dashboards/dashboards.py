@@ -195,6 +195,98 @@ async def seed_demo(dashboard_id: str):
     return {"session_id": session_id}
 
 
+@dashboards.router.post("/{dashboard_id}/seed-orchestration-demo")
+async def seed_orchestration_demo(dashboard_id: str):
+    """Create a stubbed "research agent" used by onboarding step 6.
+
+    Step 6 ("Have an agent control other agents") needs a pre-existing
+    agent for the user to attach to a new orchestrator. We seed a single
+    completed-looking session that pretends to have done research on
+    OpenSwarm, with messages mentioning what it found. The user then
+    drags it into a new agent and asks for a PDF report — which
+    delegates back to this seeded agent.
+    """
+    _load(dashboard_id)  # validate dashboard exists
+
+    session_id = uuid4().hex
+    now = datetime.now()
+
+    session_data = {
+        "id": session_id,
+        "name": "OpenSwarm research",
+        "status": "completed",
+        "provider": "anthropic",
+        "model": "sonnet",
+        "mode": "agent",
+        "sdk_session_id": None,
+        "system_prompt": None,
+        "allowed_tools": [],
+        "max_turns": None,
+        "cwd": None,
+        "created_at": now.isoformat(),
+        "closed_at": now.isoformat(),
+        "cost_usd": 0.0,
+        "tokens": {"input": 0, "output": 0},
+        "messages": [
+            {
+                "id": uuid4().hex,
+                "role": "user",
+                "content": "Research OpenSwarm and summarize what it does, who uses it, and how its built.",
+                "timestamp": now.isoformat(),
+                "branch_id": "main",
+                "parent_id": None,
+                "hidden": False,
+            },
+            {
+                "id": uuid4().hex,
+                "role": "assistant",
+                "content": (
+                    "Here's what I found on OpenSwarm:\n\n"
+                    "**What it is.** OpenSwarm is a desktop AI workspace built around\n"
+                    "agents that can read and write files, run commands, browse the web,\n"
+                    "and orchestrate other agents. It's distributed as an Electron app\n"
+                    "with a React frontend, a Python backend, and a Hono cloud service.\n\n"
+                    "**Who uses it.** Software engineers, researchers, and power users\n"
+                    "who want a model-agnostic agent platform on their own machine\n"
+                    "rather than a locked-in cloud chatbot.\n\n"
+                    "**How it's built.**\n"
+                    "- React + MUI + Redux Toolkit for the renderer.\n"
+                    "- FastAPI Python backend (agents, tools, sessions).\n"
+                    "- A Hono cloud service handles auth, billing, and account pooling.\n"
+                    "- Built-in browser cards let agents drive web pages directly.\n"
+                    "- Skills and Apps let users teach the system new capabilities.\n\n"
+                    "Ready when you are — let me know what you'd like to do with this."
+                ),
+                "timestamp": now.isoformat(),
+                "branch_id": "main",
+                "parent_id": None,
+                "hidden": False,
+            },
+        ],
+        "pending_approvals": [],
+        "branches": {
+            "main": {
+                "id": "main",
+                "parent_branch_id": None,
+                "fork_point_message_id": None,
+                "created_at": now.isoformat(),
+            }
+        },
+        "active_branch_id": "main",
+        "tool_group_meta": {},
+        "dashboard_id": dashboard_id,
+        "browser_id": None,
+        "parent_session_id": None,
+        "needs_fork": False,
+    }
+
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    with open(os.path.join(SESSIONS_DIR, f"{session_id}.json"), "w") as f:
+        json.dump(session_data, f, indent=2)
+
+    return {"session_id": session_id}
+
+
 @dashboards.router.post("/{dashboard_id}/generate-name")
 async def generate_name(dashboard_id: str):
     dashboard = _load(dashboard_id)

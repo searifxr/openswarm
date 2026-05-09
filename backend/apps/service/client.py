@@ -141,11 +141,36 @@ def _envelope() -> dict:
         env["device_type"] = "desktop"
     except Exception:
         pass
+    # Timezone: prefer the IANA zone name passed in by Electron (always
+    # canonical, e.g. "America/Los_Angeles") so cloud-side localTimeFields()
+    # can format hour-of-day correctly. Fall back to Python's local zone
+    # which sometimes returns abbreviations (PDT, CDT) or localized names
+    # ("Romance (zomertijd)") that don't round-trip through tzdata.
     try:
-        import datetime as _dt
-        local_tz = _dt.datetime.now().astimezone().tzinfo
-        if local_tz:
-            env["timezone"] = str(local_tz)
+        ianatz = os.environ.get("OPENSWARM_TIMEZONE", "").strip()
+        if not ianatz:
+            try:
+                from tzlocal import get_localzone_name  # type: ignore
+                ianatz = get_localzone_name() or ""
+            except Exception:
+                pass
+        if not ianatz:
+            import datetime as _dt
+            local_tz = _dt.datetime.now().astimezone().tzinfo
+            if local_tz:
+                ianatz = str(local_tz)
+        if ianatz:
+            env["timezone"] = ianatz
+    except Exception:
+        pass
+    # Locale: BCP 47 string ("en-US", "es-ES", etc.) injected by Electron via
+    # app.getLocale() — see electron/main.js. We don't fall back to Python's
+    # locale.getdefaultlocale() because that's deprecated, often empty, and
+    # returns inconsistent OS-specific values across macOS/Windows/Linux.
+    try:
+        loc = os.environ.get("OPENSWARM_LOCALE", "").strip()
+        if loc:
+            env["locale"] = loc
     except Exception:
         pass
     try:

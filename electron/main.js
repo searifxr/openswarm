@@ -467,6 +467,22 @@ async function startBackend() {
     OPENSWARM_PORT: String(backendPort),
     OPENSWARM_ELECTRON_PATH: process.execPath,
     OPENSWARM_INSTALL_METHOD: installMethod,
+    // Inject the app version so the Python backend can report it in the
+    // analytics envelope. Without this, _read_app_version() in
+    // service/service.py tries to read electron/package.json via a relative
+    // path that resolves correctly in `bash run.sh` dev mode but fails in
+    // packaged dmg/exe builds — which made every shipped install report
+    // app_version="unknown". The path-based fallback stays in place so this
+    // change is purely additive.
+    OPENSWARM_APP_VERSION: app.getVersion(),
+    // Inject the user's BCP 47 locale + IANA timezone. The Python backend
+    // doesn't have reliable APIs for either: locale.getdefaultlocale() is
+    // deprecated and inconsistent across OSes, and Python's local-tz string
+    // sometimes returns "PDT" or "Romance (zomertijd)" rather than
+    // "America/Los_Angeles". Electron has both in canonical form via
+    // app.getLocale() and Intl.DateTimeFormat().resolvedOptions().timeZone.
+    OPENSWARM_LOCALE: app.getLocale(),
+    OPENSWARM_TIMEZONE: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
     PYTHONDONTWRITEBYTECODE: '1',
     // PEP 540 UTF-8 mode: makes open() default to UTF-8 on Windows where
     // the locale is otherwise cp1252. Many backend modules read UTF-8
@@ -666,6 +682,27 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+
+  // Window-blur / window-focus tracking — analytics signal for "user
+  // switched to another app" (temp-churn). The renderer captures these
+  // through the existing report() pipeline; we just emit IPC notices
+  // here so the React layer can timestamp them and forward to the
+  // local backend's /api/service/submit endpoint.
+  //
+  // Cadence: at most once every 2 seconds per direction. Without that
+  // throttle, dragging a window across desktops or having a popup steal
+  // focus generates a burst of blur/focus pairs that pollute analytics
+  // with noise.
+  let _lastFocusEvent = 0;
+  const FOCUS_THROTTLE_MS = 2000;
+  const sendFocusEvent = (kind) => {
+    const now = Date.now();
+    if (now - _lastFocusEvent < FOCUS_THROTTLE_MS) return;
+    _lastFocusEvent = now;
+    sendToRenderer('openswarm:window-focus', { kind, ts: now });
+  };
+  mainWindow.on('blur', () => sendFocusEvent('blur'));
+  mainWindow.on('focus', () => sendFocusEvent('focus'));
 }
 
 function sendToRenderer(channel, ...args) {

@@ -443,56 +443,108 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     animateTo({ panX: newPanX, panY: newPanY, zoom: newZoom });
   }, [animateTo]);
 
-  const fitToCards = useCallback((cardRects: Array<{ x: number; y: number; width: number; height: number }>, maxZoom?: number, animate?: boolean, minZoom?: number) => {
-    cancelAnimation();
+  // Pure target computation — extracted so we can re-run it after the
+  // animation settles and detect viewport-rect drift mid-flight (sidebar
+  // collapse, route switch, panel mount/unmount, etc). Returns null if
+  // the viewport is missing or the rect set is empty.
+  const computeFitTarget = useCallback(
+    (
+      cardRects: Array<{ x: number; y: number; width: number; height: number }>,
+      maxZoom?: number,
+      minZoom?: number,
+    ): { panX: number; panY: number; zoom: number } | null => {
+      const viewport = viewportRef.current;
+      if (!viewport || cardRects.length === 0) return null;
+      const vRect = viewport.getBoundingClientRect();
+      if (vRect.width <= 0 || vRect.height <= 0) return null;
 
-    const viewport = viewportRef.current;
-    if (!viewport || cardRects.length === 0) {
-      setState({ panX: 0, panY: 0, zoom: 1 });
-      return;
-    }
+      let minX = Infinity,
+        minY = Infinity,
+        maxX = -Infinity,
+        maxY = -Infinity;
+      for (const card of cardRects) {
+        minX = Math.min(minX, card.x);
+        minY = Math.min(minY, card.y);
+        maxX = Math.max(maxX, card.x + card.width);
+        maxY = Math.max(maxY, card.y + card.height);
+      }
+      if (!isFinite(minX)) return null;
 
-    const vRect = viewport.getBoundingClientRect();
+      const contentWidth = maxX - minX;
+      const contentHeight = maxY - minY;
+      const availW = vRect.width - FIT_PADDING * 2;
+      const availH = vRect.height - FIT_PADDING * 2;
+      const ceiling = maxZoom ?? MAX_ZOOM;
+      const floor = minZoom ?? MIN_ZOOM;
+      const targetZoom = clamp(
+        Math.min(availW / contentWidth, availH / contentHeight),
+        floor,
+        ceiling,
+      );
+      const targetPanX =
+        (vRect.width - contentWidth * targetZoom) / 2 - minX * targetZoom;
+      const topBiased = cardRects.length === 1;
+      const targetPanY = topBiased
+        ? FIT_PADDING * 0.4 - minY * targetZoom
+        : (vRect.height - contentHeight * targetZoom) / 2 -
+          minY * targetZoom;
+      return { panX: targetPanX, panY: targetPanY, zoom: targetZoom };
+    },
+    [],
+  );
 
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const card of cardRects) {
-      minX = Math.min(minX, card.x);
-      minY = Math.min(minY, card.y);
-      maxX = Math.max(maxX, card.x + card.width);
-      maxY = Math.max(maxY, card.y + card.height);
-    }
+  const fitToCards = useCallback(
+    (
+      cardRects: Array<{ x: number; y: number; width: number; height: number }>,
+      maxZoom?: number,
+      animate?: boolean,
+      minZoom?: number,
+    ) => {
+      cancelAnimation();
 
-    if (!isFinite(minX)) {
-      setState({ panX: 0, panY: 0, zoom: 1 });
-      return;
-    }
+      const target = computeFitTarget(cardRects, maxZoom, minZoom);
+      if (!target) {
+        // Viewport unavailable / no content — keep current camera, don't
+        // snap to (0,0,1) which used to leave the minimap thinking it
+        // was centered when the canvas was anywhere.
+        if (cardRects.length === 0 || !viewportRef.current) {
+          setState({ panX: 0, panY: 0, zoom: 1 });
+        }
+        return;
+      }
 
-    const contentWidth = maxX - minX;
-    const contentHeight = maxY - minY;
-    const availW = vRect.width - FIT_PADDING * 2;
-    const availH = vRect.height - FIT_PADDING * 2;
-    const ceiling = maxZoom ?? MAX_ZOOM;
-    const floor = minZoom ?? MIN_ZOOM;
-    const targetZoom = clamp(Math.min(availW / contentWidth, availH / contentHeight), floor, ceiling);
-    const targetPanX = (vRect.width - contentWidth * targetZoom) / 2 - minX * targetZoom;
-    // For single cards, position near top of viewport (80px padding) instead of dead center
-    const topBiased = cardRects.length === 1;
-    const targetPanY = topBiased
-      ? (FIT_PADDING * 0.4) - minY * targetZoom
-      : (vRect.height - contentHeight * targetZoom) / 2 - minY * targetZoom;
-
-    const target = { panX: targetPanX, panY: targetPanY, zoom: targetZoom };
-    if (animate) {
-      // Skip if already at target (avoids jitter on re-click)
-      const cur = stateRef.current;
-      const dPan = Math.abs(cur.panX - target.panX) + Math.abs(cur.panY - target.panY);
-      const dZoom = Math.abs(cur.zoom - target.zoom);
-      if (dPan < 5 && dZoom < 0.01) return;
-      animateTo(target);
-    } else {
-      setState(target);
-    }
-  }, [cancelAnimation, animateTo]);
+      if (animate) {
+        const cur = stateRef.current;
+        const dPan = Math.abs(cur.panX - target.panX) + Math.abs(cur.panY - target.panY);
+        const dZoom = Math.abs(cur.zoom - target.zoom);
+        if (dPan < 5 && dZoom < 0.01) return;
+        animateTo(target);
+        // Settle pass — re-run the math one frame after the animation
+        // ends and snap-correct any drift from viewport changes during
+        // the flight (sidebar collapse, route switch, etc). Without
+        // this, the camera lands on stale-target coords while the
+        // minimap reads the current panX/panY, producing the visible
+        // mismatch the user reported. ~370ms = animation length (320)
+        // + one rAF settle. Cheap: a single getBoundingClientRect +
+        // potential setState if drift > threshold.
+        window.setTimeout(() => {
+          const fresh = computeFitTarget(cardRects, maxZoom, minZoom);
+          if (!fresh) return;
+          const cur2 = stateRef.current;
+          const drift =
+            Math.abs(cur2.panX - fresh.panX) +
+            Math.abs(cur2.panY - fresh.panY) +
+            Math.abs(cur2.zoom - fresh.zoom) * 1000;
+          // 8px-equivalent drift threshold — anything below is invisible
+          // to the user and not worth a snap that could itself jitter.
+          if (drift > 8) setState(fresh);
+        }, 370);
+      } else {
+        setState(target);
+      }
+    },
+    [cancelAnimation, animateTo, computeFitTarget],
+  );
 
   const handlers = useMemo(() => ({
     onMouseDown: handleMouseDown,

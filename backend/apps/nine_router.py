@@ -33,6 +33,12 @@ NINE_ROUTER_V1 = f"{NINE_ROUTER_URL}/v1"
 # translator changes broke that path — non-Claude primaries now see
 # "claude-haiku-4-5-20251001 unavailable" or hallucinated output.
 # Pinning to 0.3.60 restores v1.0.25 behavior.
+#
+# Note: 0.3.60-0.4.20 ALL emit `max_tokens` (not max_completion_tokens)
+# when translating Anthropic→OpenAI, which OpenAI's GPT-5 family rejects.
+# The fix lives in our /api/openai-passthrough proxy — see openai_passthrough.py
+# and sync_openai_api_key for how the translation lane is rerouted via an
+# `openai-compatible` provider-node that honors `baseUrl`.
 NINE_ROUTER_NPM_VERSION = "0.3.60"
 
 _process: subprocess.Popen | None = None
@@ -488,10 +494,129 @@ async def sync_gemini_api_key(api_key: str | None) -> None:
 
 
 async def sync_openai_api_key(api_key: str | None) -> None:
-    """Mirror openai_api_key into 9Router; without it, route=api GPT entries 401."""
-    await _sync_apikey_provider(
-        "openai", api_key, NINE_ROUTER_OPENAI_KEYED_NAME, label="OpenAI"
+    """Mirror openai_api_key into 9Router as an `openai-compatible` provider
+    node pointed at our local /api/openai-passthrough proxy.
+
+    Why not the built-in `openai` provider type: 9Router 0.3.60 hardcodes
+    `https://api.openai.com/v1` for the `openai` provider and ignores any
+    `baseUrl` field on the connection. Only the `openai-compatible-*`
+    provider-node type honors `baseUrl` (verified statically against
+    9Router's compiled bundle). So we register our OpenAI lane AS an
+    openai-compatible node — same upstream protocol, different routing.
+
+    Why we route through openai-passthrough at all: OpenAI's GPT-5 family
+    rejects the legacy `max_tokens` parameter with HTTP 400, but every
+    9Router version (including 0.4.20) emits `max_tokens` in its
+    Anthropic→OpenAI translator. The passthrough renames it to
+    `max_completion_tokens` for `gpt-5*` models before forwarding to
+    api.openai.com. Pre-fix: every gpt-5.* own-key session 400'd silently.
+
+    Companion change: the registry entries `gpt-5.*-api` are routed via
+    the `cp-openai/<model>` prefix (set by NINE_ROUTER_OPENAI_KEYED_PREFIX
+    below) so 9Router's translator dispatches to this provider-node
+    instead of the built-in `openai` provider.
+    """
+    await _sync_openai_compat_node(api_key)
+
+
+# Reserved prefix that registry.py's gpt-5.*-api router_model_ids depend on.
+# Changing this breaks model resolution for OpenAI own-key users.
+NINE_ROUTER_OPENAI_KEYED_PREFIX = "cp-openai"
+
+
+async def _sync_openai_compat_node(api_key: str | None) -> None:
+    """Create / update / delete the openai-compatible node + connection
+    pair we use to ferry OpenAI requests through openai-passthrough."""
+    if not is_running():
+        return
+    import os as _os
+    port = _os.environ.get("OPENSWARM_PORT", "8324")
+    base_url = f"http://127.0.0.1:{port}/api/openai-passthrough/v1"
+    managed_name = f"OpenAI{NINE_ROUTER_CUSTOM_NAME_SUFFIX}"
+
+    # List existing managed nodes — we own the prefix `cp-openai`.
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{NINE_ROUTER_API}/provider-nodes")
+            existing_nodes = (r.json().get("nodes") if r.status_code == 200 else []) or []
+    except Exception as e:
+        logger.warning(f"9Router OpenAI-compat node list failed: {e}")
+        return
+    existing_node = next(
+        (n for n in existing_nodes if isinstance(n, dict) and n.get("prefix") == NINE_ROUTER_OPENAI_KEYED_PREFIX),
+        None,
     )
+
+    # Tear down when api_key is cleared.
+    if not api_key:
+        if existing_node:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.delete(f"{NINE_ROUTER_API}/provider-nodes/{existing_node['id']}")
+                logger.info("9Router: removed OpenAI compat node (key cleared)")
+            except Exception as e:
+                logger.warning(f"9Router OpenAI compat delete failed: {e}")
+        return
+
+    node_payload = {
+        "name": managed_name,
+        "prefix": NINE_ROUTER_OPENAI_KEYED_PREFIX,
+        "apiType": "chat",
+        "baseUrl": base_url,
+        "type": "openai-compatible",
+    }
+    node_id: str | None = existing_node.get("id") if existing_node else None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if existing_node:
+                await client.put(
+                    f"{NINE_ROUTER_API}/provider-nodes/{existing_node['id']}",
+                    json=node_payload,
+                )
+                logger.info(f"9Router: updated OpenAI compat node {NINE_ROUTER_OPENAI_KEYED_PREFIX}")
+            else:
+                r = await client.post(
+                    f"{NINE_ROUTER_API}/provider-nodes", json=node_payload,
+                )
+                if r.status_code >= 300:
+                    logger.warning(
+                        f"9Router: failed to create OpenAI compat node: "
+                        f"{r.status_code} {r.text[:200]}"
+                    )
+                    return
+                node_id = (r.json() or {}).get("node", {}).get("id")
+                if not node_id:
+                    return
+                logger.info(f"9Router: created OpenAI compat node {NINE_ROUTER_OPENAI_KEYED_PREFIX} ({node_id})")
+    except Exception as e:
+        logger.warning(f"9Router OpenAI compat node sync failed: {e}")
+        return
+
+    # Connection record carrying the api key, scoped to this provider node.
+    try:
+        existing_conn = await _find_keyed_connection(node_id, managed_name)
+        conn_payload = {
+            "provider": node_id,
+            "authType": "apikey",
+            "name": managed_name,
+            "apiKey": api_key,
+            "priority": 0,
+        }
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if existing_conn:
+                await client.patch(
+                    f"{NINE_ROUTER_API}/providers/{existing_conn['id']}",
+                    json=conn_payload,
+                )
+            else:
+                r = await client.post(f"{NINE_ROUTER_API}/providers", json=conn_payload)
+                if r.status_code >= 300:
+                    logger.warning(
+                        f"9Router: failed to create OpenAI compat connection: "
+                        f"{r.status_code} {r.text[:200]}"
+                    )
+    except Exception as e:
+        logger.warning(f"9Router OpenAI compat connection sync failed: {e}")
 
 
 async def sync_openrouter_api_key(api_key: str | None) -> None:

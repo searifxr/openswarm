@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 
 
 def _read_app_version() -> str:
+    # Preferred: Electron's main process injects this when spawning the
+    # backend (see electron/main.js — OPENSWARM_APP_VERSION). Always reliable
+    # in packaged builds because it comes from app.getVersion() rather than
+    # path-based file resolution.
+    env_v = os.environ.get("OPENSWARM_APP_VERSION", "").strip()
+    if env_v:
+        return env_v
+    # Fallback: read electron/package.json via relative path. Works in
+    # `bash run.sh` dev mode where the repo layout is intact, but FAILS in
+    # packaged dmg/exe builds because electron/package.json isn't shipped
+    # into Resources/ — which made every shipped install report
+    # app_version="unknown" pre-fix. Kept for backward compatibility with
+    # dev runs and as a safety net if the env var is ever unset.
     try:
         _here = os.path.dirname(os.path.abspath(__file__))
         _repo = os.path.dirname(os.path.dirname(os.path.dirname(_here)))
@@ -395,12 +408,34 @@ async def service_status():
 
 @service.router.post("/submit")
 async def post_submit(body: dict):
+    """Accepts two body shapes for backward compatibility:
+
+    1. Frontend `report()` shape — flat `{s, a, p, submission_id, t}`.
+       This is what `frontend/src/shared/serviceClient.ts:report()` sends
+       on every UI interaction. Pass through unchanged so the cloud sees
+       it as a frontend.event.
+
+    2. Legacy `{kind, payload}` shape — used by older callers that wrapped
+       the payload in a kind+payload envelope before submitting. Unwrap
+       and forward the payload.
+
+    Pre-fix this endpoint required shape #2 and silently rejected shape #1
+    with a 200 + `{ok:false}`, so every UI event from `report()` was
+    dropped — `frontend.event` count was 0 in production analytics.
+    """
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "JSON object required"}
+    # Shape 1: frontend `report()` — flat {s, a, p, ...}
+    if any(k in body for k in ("s", "a", "p")):
+        svc.sync(body)
+        return {"ok": True}
+    # Shape 2: legacy {kind, payload}
     kind = body.get("kind") or ""
     payload = body.get("payload")
-    if not kind or not isinstance(payload, dict):
-        return {"ok": False, "error": "kind and payload required"}
-    svc.sync(payload)
-    return {"ok": True}
+    if kind and isinstance(payload, dict):
+        svc.sync(payload)
+        return {"ok": True}
+    return {"ok": False, "error": "expected {s,a,p,...} or {kind,payload}"}
 
 
 @service.router.post("/event")

@@ -1681,11 +1681,23 @@ class AgentManager:
             # MCP to register so WebSearch always cascades through our own
             # /api/web/search (Gemini → OpenAI → DuckDuckGo).
             _is_custom_session = _api_type_for_session == "custom"
+            # Only consider the user's own Anthropic API key sufficient
+            # if the conversation primary IS Claude. Pre-fix: any user
+            # with an Anthropic key set OR on OpenSwarm Pro skipped the
+            # openswarm-web MCP registration and the CLI's built-in
+            # WebSearch routed to Anthropic Haiku — which on a Codex
+            # /Gemini session drained the Pro pool's Haiku quota for
+            # WebSearch calls, even though the conversation primary
+            # (Codex/Gemini) supports native search via its own credits.
+            # Post-fix: non-Claude primaries always register openswarm-web,
+            # which cascades Gemini-native → OpenAI-native → subscriptions
+            # → DDG, only falling to Anthropic if everything else missing.
             _has_anthropic_path = (
                 not _is_custom_session
+                and _primary_is_claude
                 and (
                     bool(getattr(global_settings, "anthropic_api_key", None))
-                    or (_9r_has_anthropic and _primary_is_claude)
+                    or _9r_has_anthropic
                 )
             )
 
@@ -1859,14 +1871,27 @@ class AgentManager:
                 }
                 logger.info(f"[MCP-DEBUG] Using direct Anthropic API key (route=api) for {session.model}")
             elif _is_pinned_api_route and _api_route_provider == "openai" and getattr(global_settings, "openai_api_key", None):
-                # CLI doesn't speak OpenAI; relay through 9Router's translator.
+                # Goes through 9Router's Anthropic→OpenAI translator like
+                # other own-key routes — but we point OPENAI_BASE_URL at a
+                # tiny local pass-through (/api/openai-passthrough/v1) that
+                # renames max_tokens → max_completion_tokens before relaying
+                # to api.openai.com. OpenAI's GPT-5 family rejects max_tokens
+                # with HTTP 400, and 9Router 0.3.60 doesn't know about
+                # max_completion_tokens yet (its CLI<->OpenAI translator
+                # emits the legacy field). The pin on 0.3.60 is intentional
+                # (newer 9Router versions regress WebSearch — see
+                # nine_router.py comment) so we patch the boundary instead
+                # of bumping. Pre-fix: every gpt-5.* / gpt-5.* own-key
+                # session 400'd silently.
+                from backend.auth import get_auth_token as _get_auth_token_o
+                _passthrough_url = f"http://127.0.0.1:{os.environ.get('OPENSWARM_PORT', '8324')}/api/openai-passthrough/v1"
                 options_kwargs["env"] = {
                     "OPENAI_API_KEY": global_settings.openai_api_key,
-                    "OPENAI_BASE_URL": "https://api.openai.com/v1",
-                    "ANTHROPIC_API_KEY": "9router",
+                    "OPENAI_BASE_URL": _passthrough_url,
+                    "ANTHROPIC_API_KEY": _get_auth_token_o() or "9router",
                     "ANTHROPIC_BASE_URL": "http://localhost:20128",
                 }
-                logger.info(f"[MCP-DEBUG] Using direct OpenAI API key (route=api) for {session.model}")
+                logger.info(f"[MCP-DEBUG] Using direct OpenAI API key (route=api) for {session.model} via openai-passthrough")
             elif _is_pinned_api_route and _api_route_provider == "custom":
                 # User-configured OpenAI-compatible endpoint (Ollama Cloud,
                 # Together, local Ollama, etc.). Routes through 9Router's
@@ -3997,11 +4022,30 @@ class AgentManager:
         """Submit the session state to the cloud on close. The cloud
         consumes the dump however it sees fit; the desktop just hands off
         a snapshot. Skipped for mock sessions so dev runs don't post to
-        the real backend."""
+        the real backend.
+
+        Synthesizes a `closed_at` timestamp on the dump if the session
+        doesn't have one. Two paths previously sent close-events without
+        a timestamp and made the cloud unable to compute duration_ms
+        (which surfaced as duration_ms=null on 90% of session.ended events
+        — browser-agent and shutdown paths in particular):
+
+          1. browser_agent.py calls this without setting closed_at.
+          2. shutdown_all_sessions() clears closed_at to None for the
+             on-disk restore mechanism, then syncs.
+
+        Fix is here at the bottleneck rather than at every caller so we
+        can't miss a future call site. The on-disk session JSON keeps its
+        original (possibly None) closed_at — only the cloud-bound dump
+        gets the synthesized timestamp.
+        """
         if close_reason == "mock" or getattr(session, "_mock_run", False):
             return
         try:
-            _sync(session.model_dump(mode="json"))
+            dump = session.model_dump(mode="json")
+            if not dump.get("closed_at"):
+                dump["closed_at"] = datetime.now().isoformat()
+            _sync(dump)
         except Exception:
             pass
 

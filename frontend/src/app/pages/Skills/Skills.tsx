@@ -50,6 +50,7 @@ import {
   RegistrySkill,
   RegistrySkillDetail,
 } from '@/shared/state/skillRegistrySlice';
+import { onboardingBus } from '@/app/components/Onboarding/eventBus';
 import SkillBuilderChat, { SkillPreviewData } from './SkillBuilderChat';
 
 interface SkillForm {
@@ -189,6 +190,7 @@ const Skills: React.FC = () => {
       content: selectedReg.content,
       command: selectedReg.name.toLowerCase().replace(/\s+/g, '-'),
     }));
+    onboardingBus.emit('skill:installed');
     setSnackbar({ open: true, message: `Installed "${selectedReg.name}" as a local skill` });
   };
 
@@ -282,9 +284,11 @@ const Skills: React.FC = () => {
     selected: boolean;
     onClick: () => void;
     icon?: React.ReactNode;
-  }> = ({ label, selected, onClick, icon }) => (
+    onboardingId?: string;
+  }> = ({ label, selected, onClick, icon, onboardingId }) => (
     <Box
       onClick={onClick}
+      data-onboarding={onboardingId}
       sx={{
         display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.6,
         borderRadius: `${c.radius.sm}px`, cursor: 'pointer',
@@ -463,6 +467,9 @@ const Skills: React.FC = () => {
                           label={sk.name}
                           selected={isSelected('registry', sk.name)}
                           onClick={() => selectRegistry(sk.name)}
+                          onboardingId={
+                            /pdf/i.test(sk.name) ? 'skill-item-pdf' : undefined
+                          }
                         />
                       ))}
                     </Box>
@@ -551,6 +558,7 @@ const Skills: React.FC = () => {
                     size="small"
                     startIcon={<DownloadIcon sx={{ fontSize: 15 }} />}
                     onClick={handleInstall}
+                    data-onboarding="skill-install-button"
                     sx={{
                       bgcolor: c.accent.primary, '&:hover': { bgcolor: c.accent.pressed },
                       textTransform: 'none', borderRadius: `${c.radius.md}px`, px: 2, py: 0.5,

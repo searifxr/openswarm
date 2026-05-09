@@ -13,6 +13,7 @@ import dashboardsReducer from './dashboardsSlice';
 import updateReducer from './updateSlice';
 import modelsReducer from './modelsSlice';
 import interactionReducer from './interactionSlice';
+import onboardingProgressReducer from '@/app/components/Onboarding/OnboardingProgressSlice';
 
 export const store = configureStore({
   reducer: {
@@ -30,6 +31,7 @@ export const store = configureStore({
     update: updateReducer,
     models: modelsReducer,
     interaction: interactionReducer,
+    onboardingProgress: onboardingProgressReducer,
   },
 });
 

@@ -78,7 +78,7 @@ def _sync_identity_to_service(settings_obj) -> None:
 
 class SigninActivateRequest(BaseModel):
     token: str
-    signin_method: Literal["google"]
+    signin_method: Literal["google", "email"]
     email: Optional[str] = None
 
 

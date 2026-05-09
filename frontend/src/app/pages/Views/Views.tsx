@@ -101,6 +101,7 @@ const Views: React.FC = () => {
             variant="contained"
             startIcon={<AddIcon />}
             onClick={handleNewView}
+            data-onboarding="apps-new-button"
             sx={{
               bgcolor: c.accent.primary,
               borderRadius: 2,
@@ -144,14 +145,18 @@ const Views: React.FC = () => {
               gap: 2.5,
             }}
           >
-            {outputs.map((output) => (
-              <ViewCard
+            {outputs.map((output, idx) => (
+              <Box
                 key={output.id}
-                output={output}
-                onClick={() => handleEditView(output)}
-                onDelete={() => handleDeleteView(output.id)}
-                onRun={() => setRunOutput(output)}
-              />
+                data-onboarding={idx === 0 ? 'app-card-latest' : undefined}
+              >
+                <ViewCard
+                  output={output}
+                  onClick={() => handleEditView(output)}
+                  onDelete={() => handleDeleteView(output.id)}
+                  onRun={() => setRunOutput(output)}
+                />
+              </Box>
             ))}
           </Box>
         )}

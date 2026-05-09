@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useRef, useCallback, useMemo, MutableRefObject } from 'react';
+import { onboardingBus } from '@/app/components/Onboarding/eventBus';
 
 export interface SelectedElement {
   id: string;
@@ -70,6 +71,13 @@ export const ElementSelectionProvider: React.FC<{ children: React.ReactNode }> =
       if (existing.some((e) => e.id === el.id)) return prev;
       return { ...prev, [ownerId]: [...existing, el] };
     });
+    // Same onboarding-bus emit as addElementForOwner. Drag-select goes
+    // through THIS path (via useDomElementSelector → ctx.addSelectedElement),
+    // not addElementForOwner — so without this branch, step 5 / 6's
+    // wait-for-attached event never fires when the user actually drags.
+    if (el.semanticType === 'browser-card' || el.semanticType === 'agent-card') {
+      onboardingBus.emit('agent:attached_to_browser');
+    }
   }, []);
 
   const updateSelectedElement = useCallback((id: string, patch: Partial<SelectedElement>) => {
@@ -107,6 +115,17 @@ export const ElementSelectionProvider: React.FC<{ children: React.ReactNode }> =
       if (existing.some((e) => e.semanticData?.selectId === el.semanticData?.selectId)) return prev;
       return { ...prev, [ownerId]: [...existing, el] };
     });
+    // Surface the attachment to the onboarding bus. Step 5 ("have an
+    // agent use the browser") and step 6 ("have an agent control other
+    // agents") both wait on this event after the user repeats the
+    // drag-select gesture. Both element kinds (browser-card / agent-card)
+    // resolve the same wait — the runtime doesn't differentiate.
+    if (
+      el.semanticType === 'browser-card' ||
+      el.semanticType === 'agent-card'
+    ) {
+      onboardingBus.emit('agent:attached_to_browser');
+    }
   }, []);
 
   const removeOwnerElement = useCallback((ownerId: string, elementId: string) => {

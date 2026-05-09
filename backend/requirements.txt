@@ -16,6 +16,10 @@ python-dotenv==1.1.1
 Pillow
 httpx>=0.27.0
 trafilatura
+# tzlocal: dev-mode fallback for resolving the user's IANA timezone when
+# Electron's OPENSWARM_TIMEZONE env var isn't set (i.e. `bash run.sh`).
+# Packaged builds get the env var directly so this is a safety net.
+tzlocal
 # Test deps (pytest, pytest-asyncio) live in requirements-dev.txt — they
 # never ship to production users and shaved ~3 MB / ~200 files off the
 # Mac DMG when removed from the prod env.

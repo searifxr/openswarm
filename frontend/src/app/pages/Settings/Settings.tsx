@@ -42,6 +42,8 @@ import Collapse from '@mui/material/Collapse';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { updateSettings, closeSettingsModal, resetSystemPrompt, disconnectSubscription, signOut, AppSettings, CustomProvider, DEFAULT_SYSTEM_PROMPT } from '@/shared/state/settingsSlice';
+import { onboardingBus } from '@/app/components/Onboarding/eventBus';
+import { resetTour } from '@/app/components/Onboarding/OnboardingProgressSlice';
 import { OPENSWARM_DEFAULT_PROXY_URL } from '@/shared/config';
 import { fetchModels } from '@/shared/state/modelsSlice';
 import { setChecking, setUpdateError, setInstalling } from '@/shared/state/updateSlice';
@@ -1436,6 +1438,7 @@ const Settings: React.FC = () => {
       setConfirmDiscard(true);
     } else {
       dispatch(closeSettingsModal());
+      onboardingBus.emit('settings:closed');
     }
   }, [hasChanges, dispatch]);
 
@@ -1443,6 +1446,7 @@ const Settings: React.FC = () => {
     setConfirmDiscard(false);
     setForm({ ...settings });
     dispatch(closeSettingsModal());
+    onboardingBus.emit('settings:closed');
   }, [settings, dispatch]);
 
   const handleSaveAndClose = useCallback(async () => {
@@ -1454,6 +1458,7 @@ const Settings: React.FC = () => {
     setSaved(true);
     setConfirmDiscard(false);
     dispatch(closeSettingsModal());
+    onboardingBus.emit('settings:closed');
   }, [dispatch, form, settings, setThemeMode]);
 
   const fieldSx = {
@@ -1537,7 +1542,7 @@ const Settings: React.FC = () => {
           <Typography sx={{ color: c.text.primary, fontWeight: 600, fontSize: '1rem' }}>
             Settings
           </Typography>
-          <IconButton onClick={handleRequestClose} size="small" sx={{ color: c.text.tertiary, '&:hover': { color: c.text.primary } }}>
+          <IconButton onClick={handleRequestClose} size="small" data-onboarding="settings-close-button" sx={{ color: c.text.tertiary, '&:hover': { color: c.text.primary } }}>
             <CloseIcon sx={{ fontSize: 18 }} />
           </IconButton>
         </Box>
@@ -1559,7 +1564,7 @@ const Settings: React.FC = () => {
           }}
         >
           <Tab label="General" value="general" disableRipple />
-          <Tab label="Models" value="models" disableRipple />
+          <Tab label="Models" value="models" disableRipple data-onboarding="settings-models-tab" />
           <Tab label="Usage" value="usage" disableRipple />
           <Tab label="Commands" value="commands" disableRipple />
         </Tabs>
@@ -2132,40 +2137,85 @@ const Settings: React.FC = () => {
           )}
         </Box>
 
+        {/* Restart the onboarding tour. Wipes local progress so the
+            Get-Started panel re-opens at step 1 with no completed steps. */}
+        <Box sx={{ mt: 1, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Box>
+            <Typography sx={{ ...labelSx, mb: 0.25 }}>Onboarding tour</Typography>
+            <Typography sx={{ ...descSx, mb: 0 }}>
+              Re-run the Show me walkthrough at any time.
+            </Typography>
+          </Box>
+          <Button
+            variant="outlined"
+            size="small"
+            data-onboarding="settings-restart-tour"
+            onClick={() => {
+              report('onboarding_v2', 'tour_restarted');
+              try {
+                window.localStorage.removeItem('openswarm.onboarding.v2');
+              } catch { /* ignore */ }
+              // Soft reset via Redux — wipes completedSteps, opens the
+              // expanded panel at step 1. No reload needed; the slice's
+              // resetTour reducer handles everything in-memory and the
+              // localStorage-mirror middleware re-persists the new state.
+              dispatch(resetTour());
+              // Close the settings modal so the user sees the panel.
+              dispatch(closeSettingsModal());
+              onboardingBus.emit('settings:closed');
+            }}
+            sx={{
+              color: c.text.secondary,
+              borderColor: c.border.medium,
+              textTransform: 'none',
+              fontSize: '0.8rem',
+              whiteSpace: 'nowrap',
+              '&:hover': { color: c.accent.primary, borderColor: c.accent.primary },
+            }}
+          >
+            Restart tour
+          </Button>
+        </Box>
+
       </Box>
       ) : activeTab === 'models' ? (
       <Box sx={{ display: 'flex', flexDirection: 'column', pt: 2.5, pb: 1, gap: 2.5, animation: 'fadeIn 0.2s ease', '@keyframes fadeIn': { from: { opacity: 0 }, to: { opacity: 1 } } }}>
 
           {/* ── OPENSWARM PRO (managed) ── */}
-          <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>
-            One Subscription, No Setup
-          </Typography>
+          <Box data-onboarding="settings-pro-section" sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+            <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600 }}>
+              One Subscription, No Setup
+            </Typography>
 
-          <Typography sx={{ ...descSx, mb: 0 }}>
-            Don't have a Claude account? We'll handle it for you. One simple subscription covers Claude Sonnet, Opus, and Haiku.
-          </Typography>
+            <Typography sx={{ ...descSx, mb: 0 }}>
+              Don't have a Claude account? We'll handle it for you. One simple subscription covers Claude Sonnet, Opus, and Haiku.
+            </Typography>
 
-          <OpenSwarmProCard />
+            <OpenSwarmProCard />
+          </Box>
 
           {/* ── USE EXISTING SUBSCRIPTIONS ── */}
-          <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, mt: 1 }}>
-            Or Use Your Existing Subscriptions
-          </Typography>
+          <Box data-onboarding="settings-external-subs" sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+            <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, mt: 1 }}>
+              Or Use Your Existing Subscriptions
+            </Typography>
 
-          <Typography sx={{ ...descSx, mb: 0 }}>
-            Already paying for Claude, ChatGPT, or Gemini? Connect your subscription — no API key needed, no extra cost.
-          </Typography>
+            <Typography sx={{ ...descSx, mb: 0 }}>
+              Already paying for Claude, ChatGPT, or Gemini? Connect your subscription — no API key needed, no extra cost.
+            </Typography>
 
-          <SubscriptionCards />
+            <SubscriptionCards />
+          </Box>
 
           {/* ── API KEYS ── */}
-          <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, mt: 1 }}>
-            Or Connect With API Keys
-          </Typography>
+          <Box data-onboarding="settings-api-keys" sx={{ display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+            <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 600, mt: 1 }}>
+              Or Connect With API Keys
+            </Typography>
 
-          <Typography sx={{ ...descSx, mb: -1 }}>
-            Pay per use. Each key is stored locally on your device.
-          </Typography>
+            <Typography sx={{ ...descSx, mb: -1 }}>
+              Pay per use. Each key is stored locally on your device.
+            </Typography>
 
           {/* Anthropic */}
           <Box>
@@ -2572,6 +2622,7 @@ const Settings: React.FC = () => {
                 + Add Custom Provider
               </Button>
             </Box>
+          </Box>
           </Box>
 
       </Box>

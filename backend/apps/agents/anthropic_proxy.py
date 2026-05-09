@@ -48,16 +48,45 @@ _CLAUDE_MODEL_PREFIXES = (
 
 _GEMINI_MODEL_PREFIXES = ("gemini/", "gc/", "ag/")
 
+# Bare-model patterns that resolve to Gemini's native API (gemini-3-flash-api,
+# gemini-3.1-pro-api, gemini-3.1-flash-lite-api, etc. — when user supplies own
+# Google API key in Settings → Models). These bypass our `gemini/` prefix so
+# the prefix-only check above misses them; we match on the bare-name shape
+# here too so $schema scrubbing fires for own-key Gemini sessions.
+# Pre-fix: 8/8 own-key Gemini sessions in production failed with 400 because
+# JSON Schema's $schema field leaked into Google's tools[].function_declarations
+# payload. (See raw_payloads where status=error on every gemini-*-api session.)
+_GEMINI_BARE_MODEL_PATTERNS = ("gemini-",)
+
 # Fields Gemini's function_declarations validator rejects. 9Router 0.3.60's
-# translator strips allOf/anyOf/oneOf/const-toplevel/required but misses these.
+# translator strips allOf/anyOf/oneOf/const-toplevel/required but misses
+# these. Each one we've seen Gemini 400 on in production with "Unknown
+# name 'X' at request.tools[N].function_declarations[N].parameters.…"
 _GEMINI_FORBIDDEN_SCHEMA_KEYS = {
+    # JSON-Schema metadata fields Gemini's stricter validator doesn't accept.
     "$schema",
+    "$id",                  # ag/gemini-3.1-pro-high session, 2026-05-08
+    "$ref",                 # JSON-Schema reference; Gemini wants inlined types
+    "$defs",                # ditto
+    "definitions",          # legacy alias for $defs
+    # Constraint fields Gemini doesn't implement.
     "additionalProperties",
     "propertyNames",
     "patternProperties",
     "exclusiveMinimum",
     "exclusiveMaximum",
-    "const",  # nested const leaks through 9Router's top-level-only strip.
+    "const",                # nested const leaks through 9Router's top-level-only strip.
+    # Anthropic-specific tool-call hints not part of vanilla JSON Schema.
+    # Anthropic's CLI emits these on tools that benefit from response
+    # priming; Gemini's validator rejects all unknown keys.
+    "prefill",              # ag/gemini-3.1-pro-high session, 2026-05-08
+    "enumTitles",           # human-readable enum labels; OpenAI-only convention
+    "title",                # safe to keep usually but Gemini sometimes rejects under nested arrays
+    "examples",             # JSON-Schema 2019-09 keyword Gemini doesn't honor
+    "default",              # often allowed but rejected in nested array.items
+    "readOnly",
+    "writeOnly",
+    "deprecated",
 }
 
 
@@ -75,6 +104,59 @@ def _scrub_gemini_schema(node):
             node[i] = _scrub_gemini_schema(v)
         return node
     return node
+
+
+# Models that REQUIRE max_completion_tokens instead of max_tokens.
+# OpenAI's GPT-5.x family (gpt-5.4, gpt-5.4-mini, gpt-5.5, gpt-5.3-codex,
+# etc.) introduced this in late 2025 — the legacy `max_tokens` field returns
+# a 400 "Unsupported parameter: 'max_tokens' is not supported with this
+# model. Use 'max_completion_tokens' instead." Anthropic's CLI / SDK still
+# emits `max_tokens` because that's the Anthropic-format wire shape; we
+# rename it on the way out for OpenAI-routed GPT-5 models.
+_OPENAI_MAX_COMPLETION_TOKENS_MODELS = ("gpt-5",)
+
+
+def _is_openai_max_completion_tokens_model(model: str) -> bool:
+    """Match every shape a GPT-5 model name might arrive in. Includes:
+      - bare:               "gpt-5", "gpt-5.5", "gpt-5.4-mini"
+      - api-suffixed:       "gpt-5.5-api"  (desktop's pinned-api naming)
+      - 9router-prefixed:   "openai/gpt-5.5"  (post-translation name)
+      - codex-routed:       "cx/gpt-5.3-codex"  (CLI subscription)
+    Anything WITHOUT "gpt-5" in the (lowercased) string is rejected.
+    """
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    # Strip common routing prefixes so we can match the bare model body.
+    for prefix in ("openai/", "cx/", "openrouter/", "or:openai/", "cp/", "cp-"):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+            break
+    return any(m.startswith(p) for p in _OPENAI_MAX_COMPLETION_TOKENS_MODELS)
+
+
+def _scrub_request_for_openai_gpt5(body: bytes) -> bytes:
+    """Rename `max_tokens` → `max_completion_tokens` for GPT-5 models.
+
+    Bytes-in/out, never raises. No-op if the body isn't JSON or doesn't
+    contain `max_tokens`. Drops the legacy field if BOTH are present so
+    the API doesn't reject for "both fields specified".
+    """
+    if not body:
+        return body
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(parsed, dict):
+        return body
+    if "max_tokens" in parsed and "max_completion_tokens" not in parsed:
+        parsed["max_completion_tokens"] = parsed.pop("max_tokens")
+        return json.dumps(parsed).encode("utf-8")
+    if "max_tokens" in parsed and "max_completion_tokens" in parsed:
+        parsed.pop("max_tokens", None)
+        return json.dumps(parsed).encode("utf-8")
+    return body
 
 
 def _scrub_request_for_gemini(body: bytes) -> bytes:
@@ -122,7 +204,14 @@ def _is_claude_model(model: str) -> bool:
 
 def _is_gemini_model(model: str) -> bool:
     m = (model or "").strip().lower()
-    return m.startswith(_GEMINI_MODEL_PREFIXES)
+    if m.startswith(_GEMINI_MODEL_PREFIXES):
+        return True
+    # Bare-name match: "gemini-3-flash-api", "gemini-3.1-pro-api", etc.
+    # Excludes anthropic-routed gemini models (those carry "/" or other
+    # routing prefixes via the registry).
+    if "/" in m:
+        return False
+    return any(m.startswith(p) for p in _GEMINI_BARE_MODEL_PATTERNS)
 
 
 def _pick_upstream(model: str) -> tuple[str, dict[str, str]]:
@@ -174,6 +263,8 @@ async def proxy(rest: str, request: Request):
 
     if _is_gemini_model(model):
         body = _scrub_request_for_gemini(body)
+    if _is_openai_max_completion_tokens_model(model):
+        body = _scrub_request_for_openai_gpt5(body)
 
     base_url, auth_headers = _pick_upstream(model)
 

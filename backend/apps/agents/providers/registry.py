@@ -66,24 +66,30 @@ BUILTIN_MODELS: dict[str, list[dict[str, Any]]] = {
         {"value": "gpt-5.3-codex-xhigh", "label": "GPT-5.3 Codex Extra High",
          "context_window": 400_000, "router_model_id": "cx/gpt-5.3-codex-xhigh",
          "api": "codex", "subscription_only": True, "reasoning": True},
-        # API-key entries: bypass 9Router, call api.openai.com directly.
+        # API-key entries: route through 9Router's `cp-openai` provider-node
+        # (registered by sync_openai_api_key) so 9Router's translator
+        # dispatches to our local openai-passthrough proxy. The passthrough
+        # renames `max_tokens` → `max_completion_tokens` before forwarding
+        # to api.openai.com, fixing OpenAI's GPT-5 family 400. The bare
+        # router_model_id (e.g. "gpt-5.5") still appears in the request
+        # body; only the routing prefix changes.
         {"value": "gpt-5.5-api", "label": "GPT-5.5 (API key)",
-         "context_window": 1_000_000, "router_model_id": "gpt-5.5", "model_id": "gpt-5.5",
+         "context_window": 1_000_000, "router_model_id": "cp-openai/gpt-5.5", "model_id": "gpt-5.5",
          "api": "openai", "reasoning": True, "route": "api"},
         {"value": "gpt-5.4-api", "label": "GPT-5.4 (API key)",
-         "context_window": 1_000_000, "router_model_id": "gpt-5.4", "model_id": "gpt-5.4",
+         "context_window": 1_000_000, "router_model_id": "cp-openai/gpt-5.4", "model_id": "gpt-5.4",
          "api": "openai", "reasoning": True, "route": "api"},
         {"value": "gpt-5.4-mini-api", "label": "GPT-5.4 Mini (API key)",
-         "context_window": 400_000, "router_model_id": "gpt-5.4-mini", "model_id": "gpt-5.4-mini",
+         "context_window": 400_000, "router_model_id": "cp-openai/gpt-5.4-mini", "model_id": "gpt-5.4-mini",
          "api": "openai", "reasoning": True, "route": "api"},
         {"value": "gpt-5.3-codex-api", "label": "GPT-5.3 Codex (API key)",
-         "context_window": 400_000, "router_model_id": "gpt-5.3-codex", "model_id": "gpt-5.3-codex",
+         "context_window": 400_000, "router_model_id": "cp-openai/gpt-5.3-codex", "model_id": "gpt-5.3-codex",
          "api": "openai", "reasoning": True, "route": "api"},
         {"value": "gpt-5.3-codex-high-api", "label": "GPT-5.3 Codex High (API key)",
-         "context_window": 400_000, "router_model_id": "gpt-5.3-codex-high", "model_id": "gpt-5.3-codex-high",
+         "context_window": 400_000, "router_model_id": "cp-openai/gpt-5.3-codex-high", "model_id": "gpt-5.3-codex-high",
          "api": "openai", "reasoning": True, "route": "api"},
         {"value": "gpt-5.3-codex-xhigh-api", "label": "GPT-5.3 Codex Extra High (API key)",
-         "context_window": 400_000, "router_model_id": "gpt-5.3-codex-xhigh", "model_id": "gpt-5.3-codex-xhigh",
+         "context_window": 400_000, "router_model_id": "cp-openai/gpt-5.3-codex-xhigh", "model_id": "gpt-5.3-codex-xhigh",
          "api": "openai", "reasoning": True, "route": "api"},
     ],
     # Google: Gemini 3.x thoughtSignature continuity is bypassed via 9Router's

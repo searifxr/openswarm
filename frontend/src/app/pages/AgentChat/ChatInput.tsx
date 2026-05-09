@@ -35,6 +35,7 @@ import AttachFileIcon from '@mui/icons-material/AttachFile';
 import AdsClickIcon from '@mui/icons-material/AdsClick';
 import CommandPicker, { CommandPickerItem, getToolGroupIcon } from '@/app/components/CommandPicker';
 import { useElementSelection, SelectedElement } from '@/app/components/ElementSelectionContext';
+import { onboardingBus } from '@/app/components/Onboarding/eventBus';
 import { getClipboardCards, clearClipboard } from '@/shared/dashboardClipboard';
 import { getWebview } from '@/shared/browserRegistry';
 import { API_BASE, getAuthToken } from '@/shared/config';
@@ -803,6 +804,18 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     let trimmed = serialized.trim();
     if (!trimmed) return;
 
+    // Onboarding bus signal — step 3 (launch agent), step 5/6 (agent uses
+    // browser / agent controls agents), step 8 (make an App) all wait for
+    // the user to actually send a message before the cursor advances.
+    onboardingBus.emit('chat:message_sent');
+    // The App Builder chat lives inside ViewEditor (`/apps/new`) — when
+    // the user submits there, the underlying agent generates an app.
+    // Surface this as app:generation_started so step 8 can advance from
+    // its typing op to its "wait for app to land" op.
+    if (window.location.hash.includes('/apps/')) {
+      onboardingBus.emit('app:generation_started');
+    }
+
     // Slash commands (Phase 2). Parsed client-side so we don't pollute
     // the agent loop with meta-actions; calls the corresponding backend
     // endpoint and clears the input. /context is pure-frontend (toggle
@@ -1411,6 +1424,7 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
       <Box sx={{ px: 1.5, pt: hasAttachments ? 0.5 : 1.25, pb: 0.25, position: 'relative' }}>
         <div
           ref={editorRef}
+          data-onboarding="chat-input"
           contentEditable={!disabled}
           suppressContentEditableWarning
           spellCheck
@@ -2189,6 +2203,7 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
               <IconButton
                 size="small"
                 onMouseDown={(e) => e.preventDefault()}
+                data-onboarding="element-selection-toggle"
                 onClick={() => {
                   if (isMySelectMode) {
                     elementSelection.setSelectMode(false);
@@ -2267,6 +2282,7 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
                   size="small"
                   onClick={handleSend}
                   disabled={disabled}
+                  data-onboarding="chat-send-button"
                   sx={{
                     bgcolor: c.accent.primary,
                     color: c.text.inverse,

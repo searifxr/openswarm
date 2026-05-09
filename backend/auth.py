@@ -6,10 +6,11 @@ messages) over WebSockets. Without auth, any webpage loaded in any
 browser on the same machine can connect to those endpoints — WebSockets
 aren't subject to Same-Origin Policy — and impersonate the user.
 
-This module issues a cryptographically random token at backend startup,
-writes it 0600 to `<DATA_ROOT>/auth.token`, and provides validation
-helpers. The token changes every backend restart. Only code running as
-the same OS user can read the file.
+This module issues a cryptographically random token on first boot,
+writes it 0600 to `<DATA_ROOT>/auth.token`, and reuses it on subsequent
+restarts (so dev-mode hot-reload doesn't break the renderer's cached
+copy). The token is regenerated only when the file is missing or empty.
+Only code running as the same OS user can read the file.
 
 Delivery to legitimate consumers:
 
@@ -59,11 +60,44 @@ def _write_atomic(path: str, data: str, mode: int = 0o600) -> None:
 
 
 def init_auth_token() -> str:
-    """Generate a fresh token, persist to disk, return it.
+    """Initialise the per-install auth token, persisting to disk.
 
-    Called once at backend startup before the HTTP port is bound.
+    Behaviour: prefer an existing token on disk; only mint a fresh one
+    when the file is absent or empty. This matters for two cases:
+
+      1. Dev mode (`bash run.sh`) — uvicorn's WatchFiles reload restarts
+         the worker process and re-runs init_auth_token. If we generated
+         a fresh token every reload, Electron's cached token (read once
+         at app boot) would mismatch and every authed request 401s
+         until the user fully restarts. Preserving the on-disk token
+         keeps Electron and the backend in sync across reloads.
+
+      2. Packaged builds — the user can restart the backend (Quit + reopen)
+         without the renderer reloading. Same mismatch risk, same fix.
+
+    Security trade-off: we no longer rotate the token on every restart.
+    The threat model that rotation was protecting against (a stale token
+    sitting in a log/crash dump being usable later) is marginal — anyone
+    who can read the artifact can also re-read the on-disk token, and
+    real rotation requires the file to be deleted (e.g. by signing out
+    or wiping the data root). Net: dev-mode reliability wins.
     """
     global _TOKEN
+    # Try existing on-disk token first.
+    try:
+        if os.path.exists(AUTH_TOKEN_FILE):
+            with open(AUTH_TOKEN_FILE, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            if existing and 16 <= len(existing) <= 512:
+                _TOKEN = existing
+                logger.info(
+                    f"auth: reusing existing token from {AUTH_TOKEN_FILE}"
+                )
+                return _TOKEN
+    except Exception as e:
+        # Fall through to fresh generation on any read error.
+        logger.warning(f"auth: failed to read existing token, generating new: {e}")
+
     _TOKEN = secrets.token_urlsafe(32)
     try:
         _write_atomic(AUTH_TOKEN_FILE, _TOKEN, mode=0o600)
@@ -118,6 +152,13 @@ _AUTH_EXEMPT_PREFIX = (
     # covered without re-introducing the bootstrap deadlock that an
     # exact "/api/health" match caused.
     "/api/health",
+    # OpenAI API pass-through. 9Router calls this with the user's
+    # OpenAI Bearer token (sk-…), NOT our local auth token, so our
+    # middleware would reject. Localhost-only network boundary is the
+    # security gate — the route only forwards to api.openai.com and
+    # never touches user data on this machine. See
+    # backend/apps/agents/openai_passthrough.py for why this exists.
+    "/api/openai-passthrough",
     # FastAPI's default health/docs/schema surface (packaged app never
     # ships /docs, but be defensive).
     "/docs",

@@ -265,6 +265,7 @@ const SkillBuilderChat: React.FC<SkillBuilderChatProps> = ({ onSkillPreview, onS
       <Tooltip title="Build skill with AI" placement="left">
         <Fab
           onClick={() => setExpanded(true)}
+          data-onboarding="skill-builder-fab"
           sx={{
             position: 'absolute',
             bottom: 24,

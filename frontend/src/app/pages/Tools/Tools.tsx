@@ -1405,7 +1405,10 @@ const Tools: React.FC = () => {
               {uninstalledIntegrations.map((ig) => {
                 const isLoading = !!integrationLoading[ig.id];
                 return (
-                  <Card key={ig.id} sx={{ order: 2, bgcolor: c.bg.surface, border: `1px solid ${c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, transition: 'border-color 0.2s, box-shadow 0.2s' }}>
+                  <Card
+                    key={ig.id}
+                    sx={{ order: 2, bgcolor: c.bg.surface, border: `1px solid ${c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, transition: 'border-color 0.2s, box-shadow 0.2s' }}
+                  >
                     <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
                       <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
                         <Box sx={{
@@ -1421,7 +1424,10 @@ const Tools: React.FC = () => {
                           </Box>
                           <Typography sx={{ color: c.text.muted, fontSize: '0.84rem' }}>{ig.description}</Typography>
                         </Box>
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}>
+                        <Box
+                          data-onboarding={ig.id === 'reddit' ? 'actions-reddit-toggle' : undefined}
+                          sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}
+                        >
                           {isLoading && <CircularProgress size={16} sx={{ color: ig.color }} />}
                           <Switch
                             checked={false}
@@ -1494,10 +1500,21 @@ const Tools: React.FC = () => {
                   const allNames = [...(data.read || []), ...(data.write || [])];
                   const svcPolicy = getGroupPolicy(allNames);
                   const count = allNames.length;
+                  // Same defensive Reddit check as the outer Card — if the
+                  // Integration lookup didn't find a match we still want
+                  // these subreddits/permission selectors to attach so
+                  // step 2's chevron + permission ops resolve.
+                  const isReddit =
+                    ig?.id === 'reddit' ||
+                    tool.name?.toLowerCase() === 'reddit' ||
+                    (tool.command || '').toLowerCase().includes('reddit');
+                  const isSubredditsForReddit =
+                    isReddit && /subreddit/i.test(serviceName);
 
                   return (
                     <Box sx={{ border: `1px solid ${c.border.subtle}`, borderRadius: 1.5, overflow: 'hidden', '&:hover': { borderColor: `${c.border.medium}` } }}>
                       <Box
+                        data-onboarding={isSubredditsForReddit ? 'actions-subreddits-chevron' : undefined}
                         sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 0.75, cursor: 'pointer', bgcolor: isOpen ? c.bg.secondary : 'transparent', '&:hover': { bgcolor: c.bg.secondary } }}
                         onClick={() => setExpandedServices((p) => ({ ...p, [svcKey]: !isOpen }))}
                       >
@@ -1506,7 +1523,9 @@ const Tools: React.FC = () => {
                           <Typography sx={{ color: c.text.primary, fontSize: '0.85rem', fontWeight: 600 }}>{serviceName}</Typography>
                           <Chip label={count} size="small" sx={{ bgcolor: c.bg.page, color: c.text.muted, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
                         </Box>
-                        <PermToggle value={svcPolicy === 'mixed' ? 'ask' : svcPolicy} onChange={(v) => handleGroupPermissionChange(tool.id, allNames, v)} />
+                        <Box data-onboarding={isSubredditsForReddit ? 'actions-permission-toggle' : undefined}>
+                          <PermToggle value={svcPolicy === 'mixed' ? 'ask' : svcPolicy} onChange={(v) => handleGroupPermissionChange(tool.id, allNames, v)} />
+                        </Box>
                       </Box>
                       <Collapse in={isOpen}>
                         <Box sx={{ px: 1, pb: 1 }}>
@@ -1602,11 +1621,26 @@ const Tools: React.FC = () => {
 
                 const isDisabled = tool.enabled === false;
 
+                // Defensive Reddit detection: ig.id is the canonical key but
+                // depends on Integration metadata matching tool.name exactly.
+                // If a tool was installed under a different name shape (e.g.
+                // legacy install, manual MCP add), the lookup fails and
+                // ig?.id === 'reddit' is false. Fall back to tool.name and
+                // tool.command lowercase checks so the data-onboarding hooks
+                // still attach and onboarding click_target waits can resolve.
+                const isReddit =
+                  ig?.id === 'reddit' ||
+                  tool.name?.toLowerCase() === 'reddit' ||
+                  (tool.command || '').toLowerCase().includes('reddit');
                 return (
-                  <Card key={tool.id} sx={{ order: tool.auth_status === 'connected' ? 0 : 1, bgcolor: c.bg.surface, border: `1px solid ${isExpanded ? c.accent.primary : c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, '&:hover': { borderColor: isDisabled ? c.border.subtle : c.accent.primary, boxShadow: isDisabled ? undefined : '0 0 0 1px rgba(174,86,48,0.12)' }, transition: 'border-color 0.2s, box-shadow 0.2s' }}>
+                  <Card
+                    key={tool.id}
+                    sx={{ order: tool.auth_status === 'connected' ? 0 : 1, bgcolor: c.bg.surface, border: `1px solid ${isExpanded ? c.accent.primary : c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, '&:hover': { borderColor: isDisabled ? c.border.subtle : c.accent.primary, boxShadow: isDisabled ? undefined : '0 0 0 1px rgba(174,86,48,0.12)' }, transition: 'border-color 0.2s, box-shadow 0.2s' }}
+                  >
                     <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
                       <Box
                         sx={{ display: 'flex', alignItems: 'center', gap: 2, cursor: isDisabled ? 'default' : 'pointer' }}
+                        data-onboarding={isReddit ? 'actions-reddit-chevron' : undefined}
                         onClick={() => !isDisabled && setExpandedToolId(isExpanded ? null : tool.id)}
                       >
                         {ig && (
@@ -1684,7 +1718,11 @@ const Tools: React.FC = () => {
                           </Tooltip>
                         )}
                         {ig && (
-                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
+                          <Box
+                            data-onboarding={isReddit ? 'actions-reddit-toggle' : undefined}
+                            sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
                             {!!integrationLoading[ig.id] && <CircularProgress size={16} sx={{ color: ig.color }} />}
                             <Switch
                               checked={tool.enabled !== false}

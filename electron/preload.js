@@ -81,6 +81,16 @@ const { contextBridge, ipcRenderer } = require('electron');
       return () => ipcRenderer.removeListener('openswarm:oauth-claim', listener);
     },
 
+    // Window blur/focus events — analytics signal for "user switched
+    // to another app" (temp-churn measurement). Throttled in main.js to
+    // at most once per 2s per direction so OS-level focus storms don't
+    // pollute the event stream.
+    onWindowFocus: (cb) => {
+      const listener = (_event, payload) => cb(payload);
+      ipcRenderer.on('openswarm:window-focus', listener);
+      return () => ipcRenderer.removeListener('openswarm:window-focus', listener);
+    },
+
     // OAuth popup callback. Fires when any child webContents navigates to
     // localhost:20128/callback?code=... — main.js watches for this and
     // forwards the parsed params here. Used as a belt-and-suspenders

@@ -60,7 +60,9 @@ import NoteCard from './NoteCard';
 import CanvasControls from './CanvasControls';
 import CardSearchPalette from './CardSearchPalette';
 import DirectionHints from './DirectionHints';
-import OnboardingWalkthrough from '@/app/components/OnboardingWalkthrough';
+// OnboardingWalkthrough was retired in v2 — the new OnboardingRoot/Panel
+// (mounted in Main.tsx) replaces it. Keeping this banner to prevent stale
+// imports from sneaking back in via auto-completion.
 import DashboardToolbar from './DashboardToolbar';
 import { captureDashboardThumbnail } from './captureDashboardThumbnail';
 import { useCanvasControls } from './useCanvasControls';
@@ -160,19 +162,13 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
   const [autoFocusSessionId, setAutoFocusSessionId] = useState<string | null>(null);
   const [pendingSelectSessionId, setPendingSelectSessionId] = useState<string | null>(null);
   const [focusedCardId, setFocusedCardId] = useState<string | null>(null);
-  const [showWalkthrough, setShowWalkthrough] = useState(() => {
-    if (localStorage.getItem('openswarm_walkthrough_pending') === 'true') {
-      return true;
-    }
-    return false;
-  });
   const [newAgentBounce, setNewAgentBounce] = useState(false);
-
-  const handleWalkthroughComplete = useCallback(() => {
-    setShowWalkthrough(false);
-    localStorage.removeItem('openswarm_walkthrough_pending');
-    localStorage.setItem('openswarm_walkthrough_seen', 'true');
-    setNewAgentBounce(true);
+  // Cleanup any leftover walkthrough localStorage from v1 — the v2 panel
+  // ignores it but it would otherwise hang around forever.
+  useEffect(() => {
+    try {
+      localStorage.removeItem('openswarm_walkthrough_pending');
+    } catch { /* ignore */ }
   }, []);
 
   const handleHighlightCard = useCallback((cardId: string) => {
@@ -2136,10 +2132,6 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
       sessions={sessions}
     />
 
-    {/* Onboarding walkthrough overlay */}
-    {showWalkthrough && (
-      <OnboardingWalkthrough onComplete={handleWalkthroughComplete} />
-    )}
     </>
   );
 };
