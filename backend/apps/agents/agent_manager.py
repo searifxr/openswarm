@@ -1815,6 +1815,52 @@ class AgentManager:
                     if _bt not in effective_disallowed:
                         effective_disallowed.append(_bt)
 
+            # Tell the model directly which web tools work for this session.
+            # The Claude Code CLI's deferred-tool registry still advertises bare
+            # `WebSearch` and `WebFetch` even when we've stripped them above —
+            # frontier models (Claude/GPT-5/Gemini Pro) intuit the namespaced
+            # MCP variant from context, but smaller open-source models (gpt-oss
+            # via Ollama, smaller Llama/Qwen, etc.) thrash on the deferred-tool
+            # handshake (saw 2+ minutes of repeated `ToolSearch(select:WebSearch)`
+            # → empty matches → retry). Naming the working tool here cuts that
+            # to a single direct call. Only injected when (a) we registered the
+            # web MCP, AND (b) the user hasn't disabled the policy — matches
+            # the same gate the MCP allowlist uses, so disabling WebSearch in
+            # Settings still wins.
+            _web_tools_available = _need_web_mcp and (
+                "mcp__openswarm-web__WebSearch" in effective_allowed
+                or "mcp__openswarm-web__WebFetch" in effective_allowed
+            )
+            if _web_tools_available:
+                _hint_lines = ["<web_tools>"]
+                _hint_lines.append(
+                    "This session does NOT have the built-in `WebSearch` / "
+                    "`WebFetch` tools (they delegate to Anthropic Haiku, which "
+                    "isn't reachable on this primary). Use the MCP-backed "
+                    "equivalents instead — call them DIRECTLY, no ToolSearch "
+                    "step needed:"
+                )
+                if "mcp__openswarm-web__WebSearch" in effective_allowed:
+                    _hint_lines.append(
+                        "- `mcp__openswarm-web__WebSearch(query: str, "
+                        "num_results?: int)` — DuckDuckGo search."
+                    )
+                if "mcp__openswarm-web__WebFetch" in effective_allowed:
+                    _hint_lines.append(
+                        "- `mcp__openswarm-web__WebFetch(url: str, prompt?: "
+                        "str)` — fetch a URL and return readable text."
+                    )
+                _hint_lines.append(
+                    "Do not call `ToolSearch(select:WebSearch)` — bare "
+                    "`WebSearch` is unavailable on this session and that path "
+                    "will return empty matches."
+                )
+                _hint_lines.append("</web_tools>")
+                _web_hint = "\n".join(_hint_lines)
+                composed_prompt = (
+                    f"{composed_prompt}\n\n{_web_hint}" if composed_prompt else _web_hint
+                )
+
             # Log effective tool lists
             google_allowed = [t for t in effective_allowed if "google-workspace" in t]
             reddit_allowed = [t for t in effective_allowed if "reddit" in t]
