@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import CircularProgress from '@mui/material/CircularProgress';
-import LinearProgress from '@mui/material/LinearProgress';
+import PixelBlast from '@/app/components/PixelBlast';
 import Button from '@mui/material/Button';
 import IconButton from '@mui/material/IconButton';
 import TextField from '@mui/material/TextField';
@@ -52,105 +52,58 @@ const WORKSPACE_API = `${API_BASE}/outputs/workspace`;
 // ~60-90s the first time. The old placeholder was a static spinner + a
 // jargon-heavy "Cold start can take 60-90 seconds. Check the Terminal tab
 // to follow npm install + Vite startup output..." — non-devs read that as
-// "something is broken." Two psychology fixes here:
-//
-//   1. Indeterminate spinners feel STUCK once the user has been staring
-//      ~20 s. A LinearProgress that ALWAYS moves (even fake, asymptotic
-//      toward 95%) reads as "still working" forever.
-//   2. Rotating quirky status copy ("Brewing your app...", "Wiring
-//      things up...") gives the eye new info to process every ~6 s, so
-//      the wait doesn't feel like a single long pause.
-//
-// Implementation note: progress curve is `95 * (1 - exp(-elapsed / K))`
-// with K = 22_000 ms — reaches ~63 % at 20 s, ~85 % at 40 s, ~92 % at
-// 60 s, then plateaus. Once the workspace is actually ready, the
-// placeholder unmounts (the parent's `showInstallPlaceholder` flips
-// false) and ViewPreview takes over with a hard 100 %-feel snap.
-const COOK_MESSAGES = [
-  'Brewing your app',
-  'Gathering ingredients',
-  'Wiring things up',
-  'Tightening the bolts',
-  'Adding finishing touches',
-  'Almost there',
-];
-
+// Cold-start placeholder. Shows the same Bayer-dither pixel-blast
+// shader as the webapp_template's `index.html` splash and its placeholder
+// `pages/index.tsx`, so the visual is continuous across all three
+// phases (desktop pre-Vite, inline-HTML splash, React-rendered home).
+// Earlier revisions used a progress bar + rotating "Brewing..." copy;
+// the bar was always fake (no real progress signal) and the rotation
+// felt more anxious than calming. A single continuous animation reads
+// as "background brewing, nothing to worry about" without lying about
+// progress.
 const InstallPlaceholder: React.FC = () => {
   const c = useClaudeTokens();
-  const [progress, setProgress] = useState<number>(0);
-  const [messageIdx, setMessageIdx] = useState<number>(0);
-
-  useEffect(() => {
-    const startedAt = Date.now();
-    const K = 22_000;
-    const id = window.setInterval(() => {
-      const elapsed = Date.now() - startedAt;
-      // 95 * (1 - e^(-t/K)) — fast at first, asymptotes to 95 %.
-      setProgress(95 * (1 - Math.exp(-elapsed / K)));
-    }, 200);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      setMessageIdx((i) => (i + 1) % COOK_MESSAGES.length);
-    }, 6000);
-    return () => window.clearInterval(id);
-  }, []);
-
   return (
-    <Box
-      sx={{
-        width: '100%',
-        height: '100%',
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: 2,
-        bgcolor: c.bg.surface,
-        p: 4,
-        textAlign: 'center',
-      }}
-    >
-      <Typography
+    <Box sx={{ position: 'absolute', inset: 0, bgcolor: '#1a1a1a', overflow: 'hidden' }}>
+      <PixelBlast color={c.accent.primary} pixelSize={4} speed={0.5} edgeFade={0.3} />
+      <Box
         sx={{
-          color: c.text.primary,
-          fontSize: '1.05rem',
-          fontWeight: 600,
-          minHeight: '1.5em',
-          transition: 'opacity 300ms ease',
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 1.5,
+          pointerEvents: 'none',
+          textAlign: 'center',
+          px: 3,
         }}
-        key={messageIdx}
       >
-        {COOK_MESSAGES[messageIdx]}…
-      </Typography>
-      <Box sx={{ width: '60%', maxWidth: 360 }}>
-        <LinearProgress
-          variant="determinate"
-          value={progress}
+        <Typography
           sx={{
-            height: 6,
-            borderRadius: 3,
-            bgcolor: c.bg.elevated,
-            '& .MuiLinearProgress-bar': {
-              bgcolor: c.accent.primary,
-              transition: 'transform 400ms cubic-bezier(0.25, 0.1, 0.25, 1)',
-            },
+            fontFamily: 'Charter, Georgia, serif',
+            fontSize: '2rem',
+            fontWeight: 500,
+            color: '#f5f5f5',
+            letterSpacing: '-0.02em',
+            textShadow: '0 2px 24px rgba(26, 26, 26, 0.8)',
           }}
-        />
+        >
+          What're we brewing?
+        </Typography>
+        <Typography
+          sx={{
+            fontSize: '0.9rem',
+            color: '#b8b8b8',
+            maxWidth: 420,
+            lineHeight: 1.55,
+            textShadow: '0 2px 24px rgba(26, 26, 26, 0.8)',
+          }}
+        >
+          Drop the recipe below. I'll handle the rest.
+        </Typography>
       </Box>
-      <Typography
-        sx={{
-          color: c.text.ghost,
-          fontSize: '0.82rem',
-          maxWidth: 400,
-          lineHeight: 1.55,
-          mt: 0.5,
-        }}
-      >
-        First app takes about a minute. After this, new ones spin up in a few seconds.
-      </Typography>
     </Box>
   );
 };
@@ -1245,7 +1198,13 @@ const ViewEditor: React.FC<Props> = ({ output }) => {
         onPointerUp={onDragEnd}
         onPointerCancel={onDragEnd}
         sx={{
+          // 6px hit-target, but overlapped onto the seam via negative
+          // margins so the handle doesn't occupy its own visible column
+          // (would read as chunky dead space). Same pattern as the
+          // global sidebar handle in AppShell.
           width: 6,
+          marginLeft: '-3px',
+          marginRight: '-3px',
           flexShrink: 0,
           cursor: 'col-resize',
           position: 'relative',
@@ -1259,7 +1218,11 @@ const ViewEditor: React.FC<Props> = ({ output }) => {
             left: '50%',
             transform: 'translateX(-50%)',
             width: 1,
-            bgcolor: c.border.subtle,
+            // Truly invisible at rest. The earlier subtle border-color
+            // line crossed the chat-header's own borderBottom and the
+            // right panel's borderBottom and read as a thick T-shaped
+            // grey junction. Handle only appears on hover/active.
+            bgcolor: 'transparent',
             transition: 'width 0.15s, background-color 0.15s',
           },
           '&:hover::after, &:active::after': {
@@ -1275,18 +1238,16 @@ const ViewEditor: React.FC<Props> = ({ output }) => {
         <Box
           sx={{
             display: 'flex',
-            // `baseline` aligns the text baselines of the two inputs so
-            // "App name" (0.9 rem, weight 600) and "Description"
-            // (0.78 rem) sit on the same visual line. Previously
-            // `alignItems: center` centered each input's containing
-            // box, which differ in height because one is bigger and
-            // one had `size="small"` — that's why the smaller
-            // Description field floated higher than the App name.
             alignItems: 'baseline',
             gap: 2,
             px: 1.5,
             py: 1,
             bgcolor: c.bg.secondary,
+            // Hairline below the header so the meta strip (App name +
+            // Description) reads as its own band against the tabs row
+            // underneath, instead of merging into one chunky block of
+            // bg.secondary. Half-pixel keeps it whisper-light.
+            borderBottom: `0.5px solid ${c.border.subtle}`,
             flexShrink: 0,
             minHeight: 48,
           }}
@@ -1366,7 +1327,14 @@ const ViewEditor: React.FC<Props> = ({ output }) => {
                 minWidth: 'auto',
                 fontSize: '0.8rem',
                 textTransform: 'none',
-                fontWeight: 500,
+                // Keep ONE weight across selected and unselected. Earlier
+                // revisions bumped from 500 to 600 on selection, which
+                // widened the glyphs by a couple px per character. With
+                // three pills sharing a flex row, that width change
+                // rippled outward and the whole tab strip visibly shifted
+                // on every click. Differentiating via bgcolor + text color
+                // alone keeps the layout pixel-locked.
+                fontWeight: 600,
                 color: c.text.tertiary,
                 px: 1.75,
                 py: 0,
@@ -1378,10 +1346,7 @@ const ViewEditor: React.FC<Props> = ({ output }) => {
                 },
                 '&.Mui-selected': {
                   color: c.text.primary,
-                  // Background-fill pill instead of underline indicator
-                  // — same active-state language as a sidebar nav item.
                   bgcolor: c.bg.elevated,
-                  fontWeight: 600,
                 },
               },
             }}

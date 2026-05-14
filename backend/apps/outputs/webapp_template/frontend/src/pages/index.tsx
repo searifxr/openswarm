@@ -1,9 +1,16 @@
+// Cold-start home page for a freshly-seeded OpenSwarm App.
+//
+// Renders the same Bayer-dither shader as the inline splash in
+// `index.html`, so when React mounts and clears `#root`, the animation
+// keeps going without a visible flash. The agent overwrites this file
+// on its first turn (see SKILL.md), at which point the dither
+// disappears and the real app takes over.
+
 import React from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
-import { motion } from 'framer-motion';
+import PixelBlast from '../components/PixelBlast';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
-import logoUrl from '@/assets/logo.png';
 
 const Home: React.FC = () => {
   const c = useClaudeTokens();
@@ -11,64 +18,56 @@ const Home: React.FC = () => {
   return (
     <Box
       sx={{
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        minHeight: '100%',
-        px: 2,
+        position: 'fixed',
+        inset: 0,
+        bgcolor: '#1a1a1a',
+        overflow: 'hidden',
       }}
     >
-      <motion.div
-        initial={{ opacity: 0, y: 16 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ type: 'spring', stiffness: 380, damping: 30, mass: 0.8 }}
+      <PixelBlast
+        color={c.accent.primary}
+        pixelSize={4}
+        speed={0.5}
+        edgeFade={0.3}
+      />
+      <Box
+        sx={{
+          position: 'absolute',
+          inset: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 1.5,
+          pointerEvents: 'none',
+          textAlign: 'center',
+          px: 3,
+        }}
       >
-        <Box sx={{ maxWidth: 440, width: '100%', textAlign: 'center' }}>
-          {/* Smaller, quieter mascot — was 48 px and the loudest thing
-              on the screen. Claude Design's empty states let typography
-              lead with a tiny visual accent. Asset is imported (vite
-              bundles it) instead of `/logo.png` from public/ which
-              404'd during the cold-start window. */}
-          <Box
-            component="img"
-            src={logoUrl}
-            alt=""
-            sx={{
-              width: 32,
-              height: 32,
-              objectFit: 'contain',
-              mb: 2.5,
-              opacity: 0.85,
-            }}
-          />
-          <Typography
-            sx={{
-              fontWeight: 600,
-              fontSize: '1.4rem',
-              color: c.text.primary,
-              mb: 1,
-              // Inherit body sans — keeps the empty state consistent
-              // with the rest of the template instead of jumping to a
-              // serif headline.
-              fontFamily: 'inherit',
-              letterSpacing: '-0.02em',
-            }}
-          >
-            OpenSwarm
-          </Typography>
-          <Typography
-            sx={{
-              fontSize: '0.9rem',
-              color: c.text.tertiary,
-              fontFamily: 'inherit',
-              lineHeight: 1.55,
-            }}
-          >
-            Web app template, ready to build.
-          </Typography>
-        </Box>
-      </motion.div>
+        <Typography
+          sx={{
+            fontFamily: 'Charter, Georgia, serif',
+            fontSize: '2rem',
+            fontWeight: 500,
+            color: '#f5f5f5',
+            letterSpacing: '-0.02em',
+            textShadow: '0 2px 24px rgba(26, 26, 26, 0.8)',
+          }}
+        >
+          What're we brewing?
+        </Typography>
+        <Typography
+          sx={{
+            fontSize: '0.9rem',
+            color: '#b8b8b8',
+            maxWidth: 420,
+            lineHeight: 1.55,
+            textShadow: '0 2px 24px rgba(26, 26, 26, 0.8)',
+          }}
+        >
+          Drop the recipe below. I'll handle the rest.
+        </Typography>
+      </Box>
     </Box>
   );
 };

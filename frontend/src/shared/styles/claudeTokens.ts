@@ -43,7 +43,7 @@ export const lightTokens: ClaudeTokens = {
     md: '0 0.25rem 1.25rem rgba(0,0,0,0.035)',
     lg: '0 0.5rem 2rem rgba(0,0,0,0.08)',
   },
-  radius: { xs: 4, sm: 6, md: 8, lg: 10, xl: 12, full: 9999 },
+  radius: { xs: 8, sm: 8, md: 8, lg: 8, xl: 8, full: 9999 },
   status: {
     success: '#265B19',
     successBg: '#E9F1DC',
@@ -59,7 +59,7 @@ export const lightTokens: ClaudeTokens = {
     sans: '"Anthropic Sans", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif',
     mono: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
   },
-  transition: 'all 300ms cubic-bezier(0.165, 0.85, 0.45, 1)',
+  transition: 'all 150ms cubic-bezier(0.165, 0.85, 0.45, 1)',
 };
 
 export const darkTokens: ClaudeTokens = {
@@ -94,7 +94,7 @@ export const darkTokens: ClaudeTokens = {
     md: '0 0.25rem 1.25rem rgba(0,0,0,0.15)',
     lg: '0 0.5rem 2rem rgba(0,0,0,0.25)',
   },
-  radius: { xs: 4, sm: 6, md: 8, lg: 10, xl: 12, full: 9999 },
+  radius: { xs: 8, sm: 8, md: 8, lg: 8, xl: 8, full: 9999 },
   status: {
     success: '#7AB948',
     successBg: '#1B4614',
@@ -110,7 +110,7 @@ export const darkTokens: ClaudeTokens = {
     sans: '"Anthropic Sans", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif',
     mono: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
   },
-  transition: 'all 300ms cubic-bezier(0.165, 0.85, 0.45, 1)',
+  transition: 'all 150ms cubic-bezier(0.165, 0.85, 0.45, 1)',
 };
 
 /** @deprecated Use useClaudeTokens() hook instead for dark mode support */

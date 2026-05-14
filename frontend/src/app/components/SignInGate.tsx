@@ -7,18 +7,20 @@
 //      flips non-null and the gate self-dismisses (SignInGateLoader's
 //      poll picks up the change within ~2s).
 //
-//   2. Email + password (new in v2). Two-stage:
-//        - Stage 1: user enters email + password, we POST /api/auth/email/start
-//          on the cloud. Cloud bcrypts the password, mints a 6-digit code,
-//          stores hash in email_verifications, sends it via Resend.
+//   2. Email magic link. Two-stage:
+//        - Stage 1: user enters their email, we POST /api/auth/email/start.
+//          Cloud mints a 6-digit code, stores its hash, sends it via Resend.
 //        - Stage 2: user pastes the code, we POST /api/auth/email/verify.
-//          On success the cloud upserts the users row (sets password_hash),
-//          mints a bearer with source='email', returns the same handoff
-//          shape as Google, and the desktop's existing signin-activate
-//          path takes it from there.
+//          On success the cloud upserts the users row, mints a bearer with
+//          source='email', returns the same handoff shape as Google, and
+//          the desktop's existing signin-activate path takes it from there.
 //
-// No "Skip for now" — sign-in is mandatory in v2. Users without a Google
-// email can use the email/password path instead.
+// No password. Each sign-in (first or returning) requires reading a fresh
+// code from the inbox. Slightly more friction than a stored-password fast
+// path, but it eliminates the "someone with just my email signs in as me"
+// worry and means there's no credential to store, leak, or rotate.
+//
+// No "Skip for now" — sign-in is mandatory.
 
 import React, { useState } from 'react';
 import {
@@ -50,7 +52,6 @@ export default function SignInGate(): JSX.Element {
 
   const [stage, setStage] = useState<Stage>('choose');
   const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [errMsg, setErrMsg] = useState<string | null>(null);
@@ -73,94 +74,28 @@ export default function SignInGate(): JSX.Element {
     }
   };
 
-  const onSubmitEmailPassword = async () => {
+  const onSubmitEmail = async () => {
     setErrMsg(null);
     if (!EMAIL_REGEX.test(email.trim())) {
       setErrMsg('Enter a valid email address.');
       return;
     }
-    if (password.length < 8) {
-      setErrMsg('Password must be at least 8 characters.');
-      return;
-    }
     setBusy(true);
 
-    // Distinguishes "endpoint doesn't exist on this cloud build" from
-    // "real auth failure". 404 covers production-cloud-not-yet-deployed;
-    // a thrown fetch typically means CORS preflight rejected (also
-    // production-cloud-not-yet-deployed, since the route isn't registered).
+    // "Failed to fetch" or 404 here means the cloud build doesn't have the
+    // magic-link routes yet. Surface a single friendly hint instead of the
+    // raw network error.
     const EMAIL_UNAVAILABLE_MSG =
       "Email sign-in isn't available on this build yet. Please use Continue with Google for now, or update OpenSwarm.";
 
-    let loginRes: Response | null = null;
     try {
-      report('signin', 'email_login_attempted');
-      loginRes = await fetch(`${cloudBase}/api/auth/email/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: email.trim(),
-          password,
-          install_id: installId,
-        }),
-      });
-    } catch (err) {
-      // fetch threw — almost always CORS / network. Treat as endpoint
-      // unavailable and show the friendly message.
-      report('signin', 'email_endpoint_unreachable', { phase: 'login', err: String(err) });
-      setErrMsg(EMAIL_UNAVAILABLE_MSG);
-      setBusy(false);
-      return;
-    }
-
-    try {
-      if (loginRes.ok) {
-        const data = (await loginRes.json()) as {
-          bearer?: string;
-          user_id?: string;
-          user_email?: string;
-        };
-        if (!data.bearer) throw new Error('Server did not return a bearer.');
-        const activate = await fetch(`${API_BASE}/auth/signin-activate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            token: data.bearer,
-            email: data.user_email,
-            signin_method: 'email',
-          }),
-        });
-        if (!activate.ok) {
-          const text = await activate.text().catch(() => '');
-          throw new Error(text || `Local activate failed (${activate.status})`);
-        }
-        report('signin', 'email_login_succeeded');
-        return;
-      }
-      if (loginRes.status === 401) {
-        setErrMsg('Incorrect email or password.');
-        report('signin', 'email_login_rejected');
-        return;
-      }
-      if (loginRes.status === 404) {
-        // 404 from /login = either no account (first-time signup) OR
-        // the cloud doesn't ship this endpoint yet. Try /start; if that
-        // also 404s (or throws), the cloud build is out-of-date and we
-        // surface the friendly message.
-      } else {
-        // 5xx / unexpected. Surface a generic retry hint, not the raw text.
-        report('signin', 'email_login_unexpected', { status: loginRes.status });
-        setErrMsg("Couldn't sign you in right now. Try again in a moment.");
-        return;
-      }
-
       report('signin', 'email_start_submitted');
       let startRes: Response;
       try {
         startRes = await fetch(`${cloudBase}/api/auth/email/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: email.trim(), password }),
+          body: JSON.stringify({ email: email.trim() }),
         });
       } catch (err) {
         report('signin', 'email_endpoint_unreachable', { phase: 'start', err: String(err) });
@@ -179,8 +114,6 @@ export default function SignInGate(): JSX.Element {
         return;
       }
       setStage('code_form');
-    } catch (err) {
-      setErrMsg(`Couldn't sign you in. ${(err as Error).message || 'Try again.'}`);
     } finally {
       setBusy(false);
     }
@@ -340,7 +273,6 @@ export default function SignInGate(): JSX.Element {
                 onClick={() => {
                   setStage('choose');
                   setEmail('');
-                  setPassword('');
                   setCode('');
                   setErrMsg(null);
                 }}
@@ -427,18 +359,11 @@ export default function SignInGate(): JSX.Element {
                   label="Email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !busy) onSubmitEmail();
+                  }}
                   disabled={busy}
-                  sx={{ mb: 1.5 }}
-                  size="small"
-                />
-                <TextField
-                  fullWidth
-                  type="password"
-                  label="Password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  disabled={busy}
-                  helperText="At least 8 characters."
+                  helperText="We'll email you a 6-digit code to sign in."
                   sx={{ mb: 1.5 }}
                   size="small"
                 />
@@ -453,7 +378,7 @@ export default function SignInGate(): JSX.Element {
                   fullWidth
                   variant="contained"
                   size="large"
-                  onClick={onSubmitEmailPassword}
+                  onClick={onSubmitEmail}
                   disabled={busy}
                   sx={{
                     py: 1.3,

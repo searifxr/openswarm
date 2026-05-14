@@ -869,12 +869,18 @@ const AppShell: React.FC = () => {
                         pl: 1.25,
                         pr: 1,
                         py: 0.5,
-                        ml: '-0.5px',
+                        mx: 0.5,
                         cursor: 'pointer',
-                        borderLeft: isActive ? `1.5px solid ${c.accent.primary}` : '1.5px solid transparent',
-                        bgcolor: isActive ? `${c.accent.primary}0C` : 'transparent',
-                        '&:hover': { bgcolor: `${c.text.tertiary}0A` },
-                        transition: 'background-color 0.12s, border-color 0.12s',
+                        // Rounded pill for the active item, same shape as
+                        // toolbar tabs. Use 25-percent accent alpha so
+                        // the warm brand color reads CLEARLY against
+                        // dark-mode bg.secondary; the earlier 10
+                        // percent value muddied to grey and lost the
+                        // selected affordance entirely.
+                        borderRadius: `${c.radius.md}px`,
+                        bgcolor: isActive ? `${c.accent.primary}40` : 'transparent',
+                        '&:hover': { bgcolor: isActive ? `${c.accent.primary}55` : `${c.text.tertiary}0A` },
+                        transition: 'background-color 0.12s',
                       }}
                     >
                       <Typography
@@ -984,12 +990,18 @@ const AppShell: React.FC = () => {
                         pl: 1.25,
                         pr: 1,
                         py: 0.5,
-                        ml: '-0.5px',
+                        mx: 0.5,
                         cursor: 'pointer',
-                        borderLeft: isActive ? `1.5px solid ${c.accent.primary}` : '1.5px solid transparent',
-                        bgcolor: isActive ? `${c.accent.primary}0C` : 'transparent',
-                        '&:hover': { bgcolor: `${c.text.tertiary}0A` },
-                        transition: 'background-color 0.12s, border-color 0.12s',
+                        // Rounded pill for the active item, same shape as
+                        // toolbar tabs. Use 25-percent accent alpha so
+                        // the warm brand color reads CLEARLY against
+                        // dark-mode bg.secondary; the earlier 10
+                        // percent value muddied to grey and lost the
+                        // selected affordance entirely.
+                        borderRadius: `${c.radius.md}px`,
+                        bgcolor: isActive ? `${c.accent.primary}40` : 'transparent',
+                        '&:hover': { bgcolor: isActive ? `${c.accent.primary}55` : `${c.text.tertiary}0A` },
+                        transition: 'background-color 0.12s',
                       }}
                     >
                       <Typography
@@ -1068,7 +1080,14 @@ const AppShell: React.FC = () => {
         onMouseDown={handleResizeStart}
         onDoubleClick={handleResizeDoubleClick}
         sx={{
+          // Hit-target is 6px for ergonomic drag but the handle is
+          // positioned at -3px so it overlaps the sidebar/content seam
+          // instead of occupying its own visible column. This kills the
+          // "chunky empty strip" that read as bad spacing without
+          // shrinking the actual drag region.
           width: 6,
+          marginLeft: '-3px',
+          marginRight: '-3px',
           flexShrink: 0,
           cursor: 'col-resize',
           position: 'relative',

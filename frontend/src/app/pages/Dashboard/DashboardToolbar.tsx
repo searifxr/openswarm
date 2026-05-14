@@ -695,13 +695,13 @@ const DashboardToolbar = React.forwardRef<HTMLDivElement, Props>(
               enterDelay={200}
               title={
                 <Box sx={{ textAlign: 'center' }}>
-                  <Box sx={{ fontWeight: 600 }}>Add View  ⌘M</Box>
+                  <Box sx={{ fontWeight: 600 }}>Add App  ⌘M</Box>
                 </Box>
               }
             >
               <Box
                 role="button"
-                aria-label="Add View"
+                aria-label="Add App"
                 tabIndex={0}
                 onClick={handleOpenViewPicker}
                 data-onboarding="dashboard-toolbar-apps"

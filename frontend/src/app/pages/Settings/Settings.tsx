@@ -1370,6 +1370,18 @@ const Settings: React.FC = () => {
   );
   const [form, setForm] = useState<AppSettings>({ ...settings, ...(draft || {}) });
 
+  // Re-seed the form whenever the signed-in user changes. Without this,
+  // switching accounts left `form` holding the previous user's snapshot
+  // while Redux `settings` got reloaded for the new user, so the
+  // dirty-detector (form != settings) lit up the Save / Discard footer
+  // even though the user hadn't touched anything. Watching user_id +
+  // user_email handles sign-out, sign-in, and sign-in-as-different-user
+  // in one effect.
+  useEffect(() => {
+    setForm({ ...settings });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.user_id, settings.user_email]);
+
   // When the modal opens with a requested tab (e.g., from the warning
   // banner's "Configure models" link), switch to it.
   useEffect(() => {

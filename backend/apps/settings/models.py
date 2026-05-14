@@ -95,7 +95,7 @@ class AppSettings(BaseModel):
     # historically a self-reported onboarding field — the values agree once
     # sign-in completes (server-validated wins).
     user_id: Optional[str] = None
-    signin_method: Optional[Literal["google", "stripe"]] = None
+    signin_method: Optional[Literal["google", "stripe", "email"]] = None
 
 
 class CustomProvider(BaseModel):

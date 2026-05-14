@@ -13,6 +13,10 @@ import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import ViewPreview, { ViewPreviewHandle } from '@/app/pages/Views/ViewPreview';
 import { getDefault } from '@/app/pages/Views/InputSchemaForm';
 import { useOverlayScrollPassthrough } from './useOverlayScrollPassthrough';
+import {
+  useRuntimePreviewUrl,
+  pickPreviewUrl,
+} from '@/shared/hooks/useRuntimePreviewUrl';
 
 type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
@@ -300,26 +304,18 @@ const DashboardViewCard: React.FC<Props> = ({
         }),
       }}
     >
-      {/* Selection overlay – blocks click interaction while selected, enabling drag from anywhere */}
-      {isSelected && (
-        <Box
-          ref={scrollOverlayRef}
-          onPointerDown={handleDragPointerDown}
-          onPointerMove={handleDragPointerMove}
-          onPointerUp={handleDragPointerUp}
-          onClick={(e: React.MouseEvent) => {
-            if (justDraggedRef.current) return;
-            onCardSelect?.(output.id, 'view', e.shiftKey);
-          }}
-          sx={{
-            position: 'absolute',
-            inset: 0,
-            zIndex: 15,
-            cursor: isDragging ? 'grabbing' : 'grab',
-            touchAction: 'none',
-          }}
-        />
-      )}
+      {/* No full-card overlay when selected. Earlier revisions used one to
+          enable "drag from anywhere" while the card was selected, but it
+          also blocked every pointer event from reaching the running app
+          inside the webview — making selected apps non-interactive, which
+          is the whole point of the dashboard. Drag now happens from the
+          header strip (zIndex 16 below) which is always grabbable; the
+          rest of the card passes pointer events through to the live app.
+          ref kept so useOverlayScrollPassthrough still has a no-op target. */}
+      <Box
+        ref={scrollOverlayRef}
+        sx={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 0 }}
+      />
 
       {/* Header */}
       <Box
@@ -385,10 +381,9 @@ const DashboardViewCard: React.FC<Props> = ({
         {cmdHeld && !isSelected && (
           <Box sx={{ position: 'absolute', inset: 0, zIndex: 12 }} />
         )}
-        <ViewPreview
-          ref={previewRef}
-          serveUrl={`${SERVE_BASE}/${output.id}/serve/index.html`}
-          frontendCode={output.files?.['index.html'] ?? ''}
+        <DashboardOutputPreview
+          previewRef={previewRef}
+          output={output}
           inputData={inputData}
           backendResult={backendResult}
         />
@@ -416,3 +411,79 @@ const DashboardViewCard: React.FC<Props> = ({
 };
 
 export default React.memo(DashboardViewCard);
+
+// Preview body for an output card. Lives in the same file because it's
+// only used here; pulled out so the runtime-status WS lifecycle is tied
+// to the card's mount, not to a sibling element.
+//
+// Why this exists: old-mode flat outputs (output.files['index.html']
+// present) can render straight from `${SERVE_BASE}/${output.id}/serve/...`
+// — the legacy endpoint serves the files dict. New-mode webapp_template
+// outputs have an empty files dict (the real app lives in the workspace
+// dir behind Vite); their legacy serve URL 404s with
+// `{"detail":"File not found in output"}`. We attach to the workspace's
+// runtime, wait for runtime:status to surface a frontend_url, and point
+// the webview at the live Vite server instead.
+//
+// While Vite is booting (cold npm install, slow disk) the placeholder
+// shows so the user doesn't see the 404 JSON. Old-mode outputs without a
+// workspace_id never spawn a runtime — they just render the legacy URL
+// like they always did, so there's zero regression for existing apps.
+const DashboardOutputPreview: React.FC<{
+  previewRef: React.Ref<ViewPreviewHandle>;
+  output: Output;
+  inputData: Record<string, any>;
+  backendResult: any;
+}> = ({ previewRef, output, inputData, backendResult }) => {
+  const tokens = useClaudeTokens();
+  const workspaceId = output.workspace_id ?? null;
+  const { frontendUrl, isNewMode, isHydrating } = useRuntimePreviewUrl({
+    workspaceId,
+    enabled: !!workspaceId,
+  });
+  const { url, isBooting } = pickPreviewUrl({
+    workspaceId,
+    legacyUrl: `${SERVE_BASE}/${output.id}/serve/index.html`,
+    frontendUrl,
+    isNewMode,
+  });
+
+  // While the runtime WS is still hydrating (first ~400ms after mount,
+  // or until status frame arrives — whichever's first), render a blank
+  // body instead of the booting placeholder. Prevents a "Starting
+  // preview…" flash on warm runtimes where status was already known.
+  if (isHydrating && !frontendUrl) {
+    return <Box sx={{ width: '100%', height: '100%' }} />;
+  }
+
+  if (isBooting) {
+    return (
+      <Box
+        sx={{
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: tokens.text.muted,
+          fontSize: '0.85rem',
+          fontStyle: 'italic',
+          textAlign: 'center',
+          px: 2,
+        }}
+      >
+        Starting preview…
+      </Box>
+    );
+  }
+
+  return (
+    <ViewPreview
+      ref={previewRef}
+      serveUrl={url}
+      frontendCode={output.files?.['index.html'] ?? ''}
+      inputData={inputData}
+      backendResult={backendResult}
+    />
+  );
+};

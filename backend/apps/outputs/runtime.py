@@ -45,7 +45,15 @@ _TERMINATE_GRACE_SECONDS = 3
 # check the Terminal pane to see what went wrong — but stop blocking
 # the preview pane on a port that may never come up.
 _FRONTEND_BIND_TIMEOUT_SECONDS = 180
-_FRONTEND_BIND_POLL_INTERVAL = 0.5
+# Drop from 0.5 → 0.08 because that 500ms window was ENTIRELY user-visible
+# preview latency — after Vite actually binds we'd wait up to half a second
+# before noticing and emitting runtime:status to the editor. 80ms TCP
+# probes are cheap (async open_connection on localhost, no DNS, no
+# handshake to a real upstream) and shave the perceived cold-start by
+# roughly half a second. The asyncio.open_connection call has its own
+# 500ms connect timeout for the failure case so a wedged listener won't
+# turn this into a tight CPU loop.
+_FRONTEND_BIND_POLL_INTERVAL = 0.08
 
 
 # Process-wide mutex that serializes new-mode workspace boots so only

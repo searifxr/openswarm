@@ -123,7 +123,8 @@ If a backend is enabled (after `bash backend_init.sh`), you'll also have:
 `vite-plugin-pages` auto-registers every `.tsx` file under `frontend/src/pages/`
 as a route. **You don't touch any router config.** Just create the file.
 
-- `src/pages/index.tsx`           → `/`
+- `src/pages/index.tsx`           → `/`  (ships with a "Brewing your app"
+                                          placeholder — overwrite first)
 - `src/pages/about.tsx`           → `/about`
 - `src/pages/users/index.tsx`     → `/users`
 - `src/pages/users/[id].tsx`      → `/users/:id` (dynamic segment)
@@ -458,9 +459,29 @@ not.
 
 When making a new app from scratch:
 
-1. Replace `frontend/src/pages/index.tsx` with your home page.
-2. Add additional pages under `frontend/src/pages/`.
-3. Add a sidebar nav entry in `frontend/src/app/components/Layout/Sidebar.tsx`.
-4. Style with `useClaudeTokens()` and MUI's `sx`.
-5. If you need a backend: `bash backend_init.sh`, then add a SubApp under `backend/apps/<name>/`.
-6. Update `meta.json` with the app's name + description.
+1. **REPLACE** `frontend/src/pages/index.tsx` FIRST. The starter ships with a
+   "Brewing your app" placeholder — this is intentional, it's what the user
+   sees between React mounting and your first edit landing, and it must
+   disappear the moment your real home page is ready. Rewrite the whole
+   file with your app's actual `<Home>` component. (There's also an even
+   earlier inline splash in `index.html` that paints before any JS bundle
+   loads — leave that alone; React's first commit clears it automatically.)
+2. **Sidebar / shell is OPT-IN.** `Main.tsx` no longer wraps pages in
+   `<AppShell>`. If your app needs a sidebar (SaaS-style dashboards,
+   multi-page apps), import `AppShell` from
+   `@/app/components/Layout/AppShell` and wrap your page in it yourself:
+   ```tsx
+   import AppShell from '@/app/components/Layout/AppShell';
+   export default function Home() {
+     return <AppShell><YourContent /></AppShell>;
+   }
+   ```
+   Most apps DON'T want a sidebar (games, canvases, single-screen tools,
+   previewers, full-bleed visualizations) — just render your content directly
+   and the page will be full-bleed. Don't add a shell out of habit.
+3. Add additional pages under `frontend/src/pages/`.
+4. If using a sidebar, update its nav entries in
+   `frontend/src/app/components/Layout/Sidebar.tsx`.
+5. Style with `useClaudeTokens()` and MUI's `sx`.
+6. If you need a backend: `bash backend_init.sh`, then add a SubApp under `backend/apps/<name>/`.
+7. Update `meta.json` with the app's name + description.
