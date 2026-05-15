@@ -213,6 +213,16 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
   const restoredExpandedRef = useRef(false);
   const canvasStateRef = useRef({ panX: canvas.panX, panY: canvas.panY, zoom: canvas.zoom });
   canvasStateRef.current = { panX: canvas.panX, panY: canvas.panY, zoom: canvas.zoom };
+  // Stable getter — AgentCards read pan/zoom on demand during drag math.
+  const getCanvasState = useCallback(() => canvasStateRef.current, []);
+  // Notify the currently dragging card (if any) that pan/zoom changed so
+  // it can re-pin to the cursor. useEffect rather than render-body
+  // dispatchEvent: side effects during render are a React anti-pattern
+  // and can fire twice in strict mode. Effect runs after commit, so
+  // exactly once per real pan/zoom delta.
+  useEffect(() => {
+    window.dispatchEvent(new Event('openswarm:canvas-pan-changed'));
+  }, [canvas.panX, canvas.panY, canvas.zoom]);
 
   // ---- Edge panning during card drag ----
   const EDGE_ZONE = 60;
@@ -1973,19 +1983,21 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
                 }
               }
 
+              const isSel = selection.isSelected(sid);
               return (
                 <AgentCard
                   key={sid}
                   sessionId={sid}
                   expanded={expandedSessionIds.includes(sid)}
-                  zoom={canvas.zoom}
-                  panX={canvas.panX}
-                  panY={canvas.panY}
+                  getCanvasState={getCanvasState}
                   spawnFrom={origin}
                   exitTarget={exitTarget}
-                  isSelected={selection.isSelected(sid)}
+                  isSelected={isSel}
                   isHighlighted={highlightedCardId === sid}
-                  multiDragDelta={multiDragDelta}
+                  // Only selected cards need the live drag delta; passing
+                  // it to everyone broke memo equality for unselected
+                  // cards on every mouse-move during multi-drag.
+                  multiDragDelta={isSel ? multiDragDelta : null}
                   onCardSelect={handleCardSelect}
                   onDragStart={handleCardDragStart}
                   onDragMove={handleCardDragMove}

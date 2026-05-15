@@ -88,10 +88,6 @@ const webviewPreloadPath: string | undefined = isElectron
       || (window as any).openswarm?.getWebviewPreloadPath?.())
   : undefined;
 
-if (isElectron) {
-  // eslint-disable-next-line no-console
-  console.warn('[openswarm:card-module] webviewPreloadPath =', webviewPreloadPath);
-}
 
 type WebviewElement = BrowserWebview;
 
@@ -230,8 +226,14 @@ const BrowserCard: React.FC<Props> = ({
       };
 
       const onIpcMessage = (e: any) => {
-        // eslint-disable-next-line no-console
-        console.warn('[openswarm:card] webview ipc-message:', e?.channel, e?.args);
+        // Was previously logging every ipc-message. The preload forwards
+        // every guest-page console call as `webview-console`, so popular
+        // sites (anything with analytics, telemetry, dev hot reload, etc.)
+        // produced hundreds of host-side console.warn calls per second,
+        // each blocking the main thread when DevTools is open. That was
+        // the dominant cause of the "click-then-jump" lag on dashboards
+        // with browser cards. Drop the unconditional log; ipc channels
+        // we actually care about are handled in the branches below.
         if (e?.channel === 'passkey-detected') {
           setPasskeyDialogOpen(true);
         } else if (e?.channel === 'canvas-wheel-zoom') {
@@ -662,6 +664,9 @@ const BrowserCard: React.FC<Props> = ({
         position: 'absolute',
         // contain: webview repaints don't shake neighbor cards.
         contain: 'layout style',
+        // Own compositor layer so hover/paint invalidations stay
+        // contained to this card. See AgentCard for full rationale.
+        willChange: 'transform',
         left: displayX,
         top: displayY,
         width: displayW,

@@ -936,7 +936,11 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     if (result) {
       setPicker(result);
     } else {
-      setPicker((p) => ({ ...p, visible: false }));
+      // Bail when picker is already hidden. Previously this spread a new
+      // object on every keystroke (`{...p, visible:false}`), which React
+      // saw as a state change and re-rendered ChatInput (2400 lines) on
+      // every keypress — that was the 199ms input delay on typing.
+      setPicker((p) => p.visible ? { ...p, visible: false } : p);
     }
   }, []);
 

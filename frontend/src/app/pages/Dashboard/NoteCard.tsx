@@ -269,6 +269,9 @@ const NoteCard: React.FC<Props> = ({
         height: displayH,
         // contain: reflow inside this note doesn't shake the dashboard.
         contain: 'layout style',
+        // Own compositor layer so hover/paint invalidations stay
+        // contained to this note. See AgentCard for full rationale.
+        willChange: 'transform',
         borderRadius: `${c.radius.md}px`,
         bgcolor: palette.bg,
         border: isHighlighted

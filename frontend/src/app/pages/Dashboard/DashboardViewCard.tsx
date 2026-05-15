@@ -260,6 +260,9 @@ const DashboardViewCard: React.FC<Props> = ({
         position: 'absolute',
         // contain: iframe app repaints don't shake the rest of the dashboard.
         contain: 'layout style',
+        // Own compositor layer so hover/paint invalidations stay
+        // contained to this card. See AgentCard for full rationale.
+        willChange: 'transform',
         left: displayX,
         top: displayY,
         width: displayW,

@@ -149,7 +149,9 @@ const RichPromptEditor: React.FC<RichPromptEditorProps> = ({
     if (result) {
       setPicker(result);
     } else {
-      setPicker((p) => ({ ...p, visible: false }));
+      // See ChatInput: bail when already hidden to avoid a per-keystroke
+      // re-render of the whole editor on every keypress.
+      setPicker((p) => p.visible ? { ...p, visible: false } : p);
     }
   }, []);
 

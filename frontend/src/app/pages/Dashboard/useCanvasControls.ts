@@ -181,6 +181,65 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     const el = viewportRef.current;
     if (!el || !enabled) return;  // Skip wheel listener when canvas is hidden
 
+    // RAF-coalesce wheel-driven state updates. Trackpads fire wheel
+    // events at ~120Hz; without batching, every event triggered a full
+    // Dashboard re-render (all hooks + selectors + the cards .map). The
+    // visible pan was fine because transform-only changes are cheap to
+    // composite, but the JS-side render storm at 120fps caused the
+    // "low FPS" feel during two-finger drag. Accumulating deltas per
+    // frame caps Dashboard re-renders at the display's refresh rate
+    // (usually 60Hz), with no perceptible motion difference because we
+    // apply all the accumulated deltas in one shot.
+    let pendingPanDx = 0;
+    let pendingPanDy = 0;
+    let pendingZoomDy = 0;
+    let pendingZoomCenter: { cx: number; cy: number } | null = null;
+    let wheelRafId: number | null = null;
+
+    const flushWheel = () => {
+      wheelRafId = null;
+      const dx = pendingPanDx; const dy = pendingPanDy;
+      const zDy = pendingZoomDy; const zCenter = pendingZoomCenter;
+      pendingPanDx = 0; pendingPanDy = 0;
+      pendingZoomDy = 0; pendingZoomCenter = null;
+
+      if (zCenter && zDy !== 0) {
+        setState((prev) => {
+          const factor = Math.pow(2, -zDy * sensitivityToMultiplier(sensitivityRef.current));
+          const newZoom = clamp(prev.zoom * factor, MIN_ZOOM, MAX_ZOOM);
+          const ratio = newZoom / prev.zoom;
+          return {
+            panX: zCenter.cx - (zCenter.cx - prev.panX) * ratio,
+            panY: zCenter.cy - (zCenter.cy - prev.panY) * ratio,
+            zoom: newZoom,
+          };
+        });
+      } else if (dx !== 0 || dy !== 0) {
+        setState((prev) => ({
+          ...prev,
+          panX: prev.panX - dx,
+          panY: prev.panY - dy,
+        }));
+      }
+    };
+
+    const scheduleWheelFlush = () => {
+      if (wheelRafId != null) return;
+      wheelRafId = requestAnimationFrame(flushWheel);
+    };
+
+    // Cache "is this element a scrollable child" decision per node. The
+    // canvas wheel handler walks up from e.target to el on every event;
+    // without caching, it called getComputedStyle on every ancestor on
+    // every wheel event (120Hz from a trackpad × 5-10 ancestors × style
+    // recalc). That was the dominant cost of trackpad two-finger
+    // navigation — RAF-coalescing the state update only fixed half of
+    // the problem. WeakMap entries get GC'd with their elements; no
+    // manual invalidation needed for unmounted DOM. We do invalidate
+    // explicitly when a node's scroll capacity might have changed (see
+    // the resize observer below).
+    const scrollableCache: WeakMap<HTMLElement, 'scrollable' | 'not'> = new WeakMap();
+
     const onWheel = (e: WheelEvent) => {
       // Pinch-to-zoom on trackpads sets ctrlKey; plain scroll does not
       const isPinchZoom = e.ctrlKey || e.metaKey;
@@ -191,19 +250,35 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
       const dx = e.deltaMode === 1 ? e.deltaX * 40 : e.deltaX;
       let target = e.target as HTMLElement | null;
       while (target && target !== el) {
-        const style = getComputedStyle(target);
-        const overflowY = style.overflowY;
-        const overflowX = style.overflowX;
+        // Cached classification: 'scrollable' = has overflow auto/scroll
+        // AND content exceeds its frame in some direction. 'not' = neither.
+        // Fast path: cheap scrollHeight/scrollWidth read (a layout-flushing
+        // property, but no style recalc) before paying for getComputedStyle.
+        let cls = scrollableCache.get(target);
+        if (cls === undefined) {
+          const couldScroll =
+            target.scrollHeight > target.clientHeight ||
+            target.scrollWidth > target.clientWidth;
+          if (couldScroll) {
+            const style = getComputedStyle(target);
+            const oy = style.overflowY;
+            const ox = style.overflowX;
+            const isOverflowScrollable =
+              oy === 'auto' || oy === 'scroll' || ox === 'auto' || ox === 'scroll';
+            cls = isOverflowScrollable ? 'scrollable' : 'not';
+          } else {
+            cls = 'not';
+          }
+          scrollableCache.set(target, cls);
+        }
 
-        const canScrollY =
-          target.scrollHeight > target.clientHeight &&
-          (overflowY === 'auto' || overflowY === 'scroll');
-        const canScrollX =
-          target.scrollWidth > target.clientWidth &&
-          (overflowX === 'auto' || overflowX === 'scroll');
-
-        if ((canScrollY || canScrollX) && !isPinchZoom) {
-          // Check if at scroll boundary in the scroll direction
+        if (cls === 'scrollable' && !isPinchZoom) {
+          // Re-read scrollHeight/clientHeight here (cheap, no style recalc)
+          // to make the at-boundary check responsive — the cached decision
+          // is structural (does this element have overflow:auto/scroll AND
+          // exceed its frame); the current scroll position is dynamic.
+          const canScrollY = target.scrollHeight > target.clientHeight;
+          const canScrollX = target.scrollWidth > target.clientWidth;
           const atYBoundary = !canScrollY ||
             (dy > 0 && target.scrollTop + target.clientHeight >= target.scrollHeight - 1) ||
             (dy < 0 && target.scrollTop <= 1);
@@ -228,28 +303,19 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
       }
 
       if (isPinchZoom) {
-        // Pinch gesture → zoom centered on cursor
+        // Pinch gesture → accumulate zoom deltas + last cursor position.
+        // factor = 2^(-Σdy·s) which equals the product of per-event
+        // factors, so accumulating dy is mathematically identical to
+        // applying each event one at a time.
         const rect = el.getBoundingClientRect();
-        const cx = e.clientX - rect.left;
-        const cy = e.clientY - rect.top;
-
-        setState((prev) => {
-          const factor = Math.pow(2, -dy * sensitivityToMultiplier(sensitivityRef.current));
-          const newZoom = clamp(prev.zoom * factor, MIN_ZOOM, MAX_ZOOM);
-          const ratio = newZoom / prev.zoom;
-          return {
-            panX: cx - (cx - prev.panX) * ratio,
-            panY: cy - (cy - prev.panY) * ratio,
-            zoom: newZoom,
-          };
-        });
+        pendingZoomDy += dy;
+        pendingZoomCenter = { cx: e.clientX - rect.left, cy: e.clientY - rect.top };
+        scheduleWheelFlush();
       } else {
-        // Two-finger scroll → pan
-        setState((prev) => ({
-          ...prev,
-          panX: prev.panX - dx,
-          panY: prev.panY - dy,
-        }));
+        // Two-finger scroll → accumulate pan deltas.
+        pendingPanDx += dx;
+        pendingPanDy += dy;
+        scheduleWheelFlush();
       }
     };
 
@@ -264,28 +330,23 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
       const detail = (e as CustomEvent).detail || {};
       const dy = detail.deltaMode === 1 ? detail.deltaY * 40 : detail.deltaY;
       const rect = el.getBoundingClientRect();
-      const cx = (detail.clientX ?? 0) - rect.left;
-      const cy = (detail.clientY ?? 0) - rect.top;
       if (inertiaFrameRef.current) {
         cancelAnimationFrame(inertiaFrameRef.current);
         inertiaFrameRef.current = null;
       }
-      setState((prev) => {
-        const factor = Math.pow(2, -dy * sensitivityToMultiplier(sensitivityRef.current));
-        const newZoom = clamp(prev.zoom * factor, MIN_ZOOM, MAX_ZOOM);
-        const ratio = newZoom / prev.zoom;
-        return {
-          panX: cx - (cx - prev.panX) * ratio,
-          panY: cy - (cy - prev.panY) * ratio,
-          zoom: newZoom,
-        };
-      });
+      pendingZoomDy += dy;
+      pendingZoomCenter = {
+        cx: (detail.clientX ?? 0) - rect.left,
+        cy: (detail.clientY ?? 0) - rect.top,
+      };
+      scheduleWheelFlush();
     };
     window.addEventListener('openswarm:canvas-wheel-zoom', onForwardedZoom);
 
     return () => {
       el.removeEventListener('wheel', onWheel);
       window.removeEventListener('openswarm:canvas-wheel-zoom', onForwardedZoom);
+      if (wheelRafId != null) cancelAnimationFrame(wheelRafId);
     };
   }, [enabled]);
 
@@ -303,26 +364,54 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     };
   }, [cancelAnimation, cancelInertia]);
 
+  // RAF-coalesce mouse-drag pan. Mouse events fire at 60-240Hz; without
+  // batching, every event called setState directly and Dashboard
+  // re-rendered at the same rate, causing the "hop hop hop" feel when
+  // dragging the canvas with the cursor. Velocity history still captures
+  // per-event (for inertia accuracy on mouseup) — only the React state
+  // update is throttled.
+  const dragRafRef = useRef<number | null>(null);
+  const latestDragRef = useRef<{ dx: number; dy: number } | null>(null);
+  const flushDrag = useCallback(() => {
+    dragRafRef.current = null;
+    const start = panStartRef.current;
+    const latest = latestDragRef.current;
+    if (!start || !latest) return;
+    setState((prev) => ({
+      ...prev,
+      panX: start.panX + latest.dx,
+      panY: start.panY + latest.dy,
+    }));
+  }, []);
+
   const handleMouseMove = useCallback((e: React.MouseEvent) => {
     const start = panStartRef.current;
     if (!start) return;
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
 
-    // Track velocity (keep last 5 positions)
+    // Velocity history is per-event so inertia stays accurate on
+    // mouseup. Cheap; just pushes to a length-5 ring buffer.
     const now = performance.now();
     const history = velocityHistoryRef.current;
     history.push({ x: e.clientX, y: e.clientY, t: now });
     if (history.length > 5) history.shift();
 
-    setState((prev) => ({
-      ...prev,
-      panX: start.panX + dx,
-      panY: start.panY + dy,
-    }));
-  }, []);
+    latestDragRef.current = { dx, dy };
+    if (dragRafRef.current == null) {
+      dragRafRef.current = requestAnimationFrame(flushDrag);
+    }
+  }, [flushDrag]);
 
   const handleMouseUp = useCallback(() => {
+    // Apply any pending drag delta synchronously so the final position
+    // matches where the cursor was released, then drop the scheduled RAF.
+    if (dragRafRef.current != null) {
+      cancelAnimationFrame(dragRafRef.current);
+      dragRafRef.current = null;
+      flushDrag();
+    }
+    latestDragRef.current = null;
     const wasPanning = !!panStartRef.current;
     let didInertia = false;
     if (wasPanning) {

@@ -240,9 +240,13 @@ const HANDLE_DEFS: { dir: ResizeDir; sx: Record<string, any> }[] = [
 interface OuterProps {
   sessionId: string;
   expanded: boolean;
-  zoom?: number;
-  panX?: number;
-  panY?: number;
+  // Stable getter — cards read pan/zoom on demand (drag math) instead of
+  // receiving them as props. Without this, every wheel/pan tick on the
+  // canvas re-rendered every card, even though the canvas root's CSS
+  // transform is what actually moves them visually. Cards only need the
+  // values inside drag callbacks; making it a ref-backed getter keeps
+  // pan/zoom out of memo equality entirely.
+  getCanvasState: () => { panX: number; panY: number; zoom: number };
   spawnFrom?: { x: number; y: number; type?: 'branch' };
   exitTarget?: { x: number; y: number };
   isSelected?: boolean;
@@ -268,6 +272,7 @@ interface Props extends Omit<OuterProps, 'sessionId'> {
   cardWidth: number;
   cardHeight: number;
   cardZOrder: number;
+  getCanvasState: () => { panX: number; panY: number; zoom: number };
 }
 
 const MIN_W = 480;
@@ -282,7 +287,7 @@ const GLOW_FADE_MS = 2500;
 const SNAP_THRESHOLD = 60;
 
 const AgentCard: React.FC<Props> = ({
-  session, expanded, cardX, cardY, cardWidth, cardHeight, zoom = 1, panX = 0, panY = 0, spawnFrom, exitTarget,
+  session, expanded, cardX, cardY, cardWidth, cardHeight, getCanvasState, spawnFrom, exitTarget,
   isSelected = false, isHighlighted = false, multiDragDelta, onCardSelect, onDragStart, onDragMove, onDragEnd,
   onBranch, onMeasuredHeight, snapColumn, autoFocusInput, cardZOrder = 0, onDoubleClick, onBringToFront,
   shakeDirection,
@@ -371,46 +376,47 @@ const AgentCard: React.FC<Props> = ({
   const justDraggedRef = useRef(false);
   const lastPointerRef = useRef<{ clientX: number; clientY: number }>({ clientX: 0, clientY: 0 });
 
-  // Use refs for pan so drag callbacks don't recreate on every pan frame
-  const panRef = useRef({ panX, panY });
-  panRef.current = { panX, panY };
-  const zoomRef = useRef(zoom);
-  zoomRef.current = zoom;
-
   const handleDragPointerDown = useCallback((e: React.PointerEvent) => {
     if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
-    dragState.current = { startX: e.clientX, startY: e.clientY, origX: cardX, origY: cardY, startPanX: panRef.current.panX, startPanY: panRef.current.panY };
+    const cs = getCanvasState();
+    dragState.current = { startX: e.clientX, startY: e.clientY, origX: cardX, origY: cardY, startPanX: cs.panX, startPanY: cs.panY };
     lastPointerRef.current = { clientX: e.clientX, clientY: e.clientY };
     didDrag.current = false;
     setIsDragging(true);
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     onDragStart?.(session.id, 'agent');
-  }, [cardX, cardY, onDragStart, session.id]);
+  }, [cardX, cardY, onDragStart, session.id, getCanvasState]);
 
-  // Recompute localDragPos from latest pointer + pan (shared by move handler and pan-change effect)
+  // Recompute localDragPos from latest pointer + pan (shared by move handler and pan-change event)
   const recomputeDragPos = useCallback(() => {
     const ds = dragState.current;
     if (!ds || !didDrag.current) return;
     const { clientX, clientY } = lastPointerRef.current;
     const rawDx = clientX - ds.startX;
     const rawDy = clientY - ds.startY;
-    const z = zoomRef.current;
-    const panDx = (panRef.current.panX - ds.startPanX) / z;
-    const panDy = (panRef.current.panY - ds.startPanY) / z;
+    const cs = getCanvasState();
+    const z = cs.zoom;
+    const panDx = (cs.panX - ds.startPanX) / z;
+    const panDy = (cs.panY - ds.startPanY) / z;
     const dx = rawDx / z - panDx;
     const dy = rawDy / z - panDy;
     setLocalDragPos({ x: ds.origX + dx, y: ds.origY + dy });
     onDragMove?.(dx, dy, clientX, clientY);
-  }, [onDragMove]);
+  }, [onDragMove, getCanvasState]);
 
-  // When pan changes during an active drag, recompute position so card tracks cursor
+  // When pan changes during an active drag (edge-pan or wheel-zoom-while-
+  // dragging), Dashboard dispatches `openswarm:canvas-pan-changed`. Only
+  // active during a drag so non-dragging cards stay subscribed-to-nothing.
   useEffect(() => {
-    if (isDragging && didDrag.current) {
-      recomputeDragPos();
-    }
-  }, [panX, panY, isDragging, recomputeDragPos]);
+    if (!isDragging) return;
+    const onPanChange = () => {
+      if (didDrag.current) recomputeDragPos();
+    };
+    window.addEventListener('openswarm:canvas-pan-changed', onPanChange);
+    return () => window.removeEventListener('openswarm:canvas-pan-changed', onPanChange);
+  }, [isDragging, recomputeDragPos]);
 
   const handleDragPointerMove = useCallback((e: React.PointerEvent) => {
     if (!dragState.current) return;
@@ -424,9 +430,10 @@ const AgentCard: React.FC<Props> = ({
 
   const handleDragPointerUp = useCallback((e: React.PointerEvent) => {
     if (!dragState.current) return;
-    const z = zoomRef.current;
-    const panDx = (panRef.current.panX - dragState.current.startPanX) / z;
-    const panDy = (panRef.current.panY - dragState.current.startPanY) / z;
+    const cs = getCanvasState();
+    const z = cs.zoom;
+    const panDx = (cs.panX - dragState.current.startPanX) / z;
+    const panDy = (cs.panY - dragState.current.startPanY) / z;
     const dx = (e.clientX - dragState.current.startX) / z - panDx;
     const dy = (e.clientY - dragState.current.startY) / z - panDy;
     if (didDrag.current) {
@@ -454,7 +461,7 @@ const AgentCard: React.FC<Props> = ({
     setLocalDragPos(null);
     setIsDragging(false);
     (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-  }, [dispatch, session.id, onDragEnd, snapColumn, cardHeight]);
+  }, [dispatch, session.id, onDragEnd, snapColumn, cardHeight, getCanvasState]);
 
   // ---- Unified edge / corner resize ----
   const resizeRef = useRef<{
@@ -495,8 +502,9 @@ const AgentCard: React.FC<Props> = ({
     (e: React.PointerEvent) => {
       if (!resizeRef.current) return null;
       const { dir, startX, startY, origX, origY, origW, origH } = resizeRef.current;
-      const dx = (e.clientX - startX) / zoom;
-      const dy = (e.clientY - startY) / zoom;
+      const z = getCanvasState().zoom;
+      const dx = (e.clientX - startX) / z;
+      const dy = (e.clientY - startY) / z;
 
       let newX = origX, newY = origY, newW = origW, newH = origH;
 
@@ -510,7 +518,7 @@ const AgentCard: React.FC<Props> = ({
 
       return { x: newX, y: newY, w: newW, h: newH };
     },
-    [zoom],
+    [getCanvasState],
   );
 
   const handleResizeMove = useCallback(
@@ -647,6 +655,16 @@ const AgentCard: React.FC<Props> = ({
         // boxShadows legitimately extend past the card border — `paint`
         // containment would clip those visuals.
         contain: 'layout style',
+        // Promote each card to its own compositor layer so paint
+        // invalidations (hover effects, streaming content updates,
+        // highlight pulses) stay contained to that one card's layer
+        // instead of forcing the canvas's GPU-promoted root layer to
+        // re-paint. The performance trace showed pointer hover events
+        // costing 100-200ms of pure presentation time before this,
+        // because every hover-cross re-painted the entire canvas
+        // composite. Costs ~card_area*4 bytes of GPU memory per card;
+        // trivial on modern hardware for the dashboard's card counts.
+        willChange: 'transform',
         width: localResize ? activeW : Math.max(cardWidth, MIN_W),
         height: localResize ? activeH : (expanded ? Math.max(EXPANDED_OVERLAY_H, cardHeight) : 'auto'),
         bgcolor: c.bg.surface,
@@ -740,8 +758,12 @@ const AgentCard: React.FC<Props> = ({
           },
         }),
         ...(!isHighlighted && !(isGlowingRedux && !glowFading) && !expanded && !isDragging && !isSelected && {
+          // Hover: borderColor only. Was previously also bumping boxShadow
+          // from .sm to .md, but the trace data showed pointer hover events
+          // costing 120-207ms PRESENTATION because every shadow change
+          // forced a full GPU re-blur of every card on the transformed
+          // canvas layer. Border color is layout-free and ~free to paint.
           '&:hover': {
-            boxShadow: c.shadow.md,
             borderColor: hasPending ? c.status.warning : c.border.strong,
           },
         }),

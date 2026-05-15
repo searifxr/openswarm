@@ -1158,7 +1158,22 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
               const rawText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
 
               return (
-                <Box key={msg.id} sx={{ '&:hover .msg-actions': { opacity: 1 } }}>
+                <Box
+                  key={msg.id}
+                  sx={{
+                    '&:hover .msg-actions': { opacity: 1 },
+                    // Cheap virtualization: tells the browser to skip
+                    // paint + layout for bubbles outside the scroll
+                    // viewport. `contain-intrinsic-size: auto N` reserves
+                    // a placeholder height so the scrollbar doesn't jump,
+                    // and `auto` lets the browser remember the actual
+                    // height after first render. Works alongside the
+                    // container's overflow-anchor. Chrome 85+ (Electron
+                    // covers this).
+                    contentVisibility: 'auto',
+                    containIntrinsicSize: 'auto 120px',
+                  }}
+                >
                   <MessageBubble
                     message={msg}
                     editing={isEditing}
