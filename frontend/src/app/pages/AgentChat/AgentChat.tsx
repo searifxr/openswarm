@@ -40,6 +40,7 @@ import {
 } from '@/shared/state/agentsSlice';
 import { fetchModes } from '@/shared/state/modesSlice';
 import { createSessionWs } from '@/shared/ws/WebSocketManager';
+import StreamingBubble from './StreamingBubble';
 import MessageBubble from './MessageBubble';
 import CompactionMarker from './CompactionMarker';
 import MessageActionBar from './MessageActionBar';
@@ -351,7 +352,13 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
   // so it never fires during normal streaming.
   const reconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageCount = session?.messages?.length ?? 0;
-  const hasStreaming = !!session?.streamingMessage;
+  // Subscribe only to the streaming MESSAGE ID (stable across the 30Hz
+  // delta updates), never to the content. The actual streaming text
+  // renders inside the leaf <StreamingBubble> below, which subscribes to
+  // the content itself. This keeps AgentChat's render and useEffects
+  // dormant during streaming; only the bubble updates per delta.
+  const streamingMessageId = useAppSelector((s) => id ? s.streaming.bySession[id]?.id ?? null : null);
+  const hasStreaming = !!streamingMessageId;
 
   useEffect(() => {
     if (reconcileTimer.current) {
@@ -417,7 +424,11 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
 
   const scrollRafRef = useRef<number | null>(null);
   const lastScrollHeightRef = useRef<number>(0);
-  useEffect(() => {
+  // Shared scroll-stick routine. Used both by the structural-events
+  // useEffect below (new message lands / stream starts/ends) and by
+  // StreamingBubble's onStreamGrew callback (per-delta growth). RAF +
+  // height-grew gate ensures we only set scrollTop when needed.
+  const stickToBottomIfNeeded = useCallback(() => {
     if (!isAtBottomRef.current) return;
     if (scrollRafRef.current != null) return;
     scrollRafRef.current = requestAnimationFrame(() => {
@@ -425,20 +436,19 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
       if (!isAtBottomRef.current) return;
       const el = scrollContainerRef.current;
       if (!el) return;
-      // Only set scrollTop when the scrollable height actually grew.
-      // Otherwise we're forcing a paint for nothing — and on a
-      // streaming turn we get one of these per delta, which thrashes
-      // the compositor for zero visible benefit. The native
-      // overflow-anchor on the container already keeps the viewport
-      // pinned to the bottom; this JS fallback only needs to handle
-      // the rare case where anchoring misses (legacy WebKit,
-      // virtualized children, dynamic-height inserts).
       const newHeight = el.scrollHeight;
       if (newHeight === lastScrollHeightRef.current) return;
       lastScrollHeightRef.current = newHeight;
       el.scrollTop = newHeight;
     });
-  }, [session?.messages.length, session?.streamingMessage?.content]);
+  }, []);
+  useEffect(() => {
+    stickToBottomIfNeeded();
+    // Structural triggers only: a new message lands or a stream
+    // starts/ends. Streaming content updates trigger this via
+    // <StreamingBubble onStreamGrew={stickToBottomIfNeeded} /> instead
+    // so AgentChat stays dormant during the 30Hz delta storm.
+  }, [session?.messages.length, streamingMessageId, stickToBottomIfNeeded]);
 
   useEffect(() => () => {
     if (scrollRafRef.current != null) {
@@ -447,19 +457,31 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
     }
   }, []);
 
-  const handleSend = (prompt: string, images?: Array<{ data: string; media_type: string }>, contextPaths?: Array<{ path: string; type: 'file' | 'directory' }>, forcedTools?: string[], attachedSkills?: Array<{ id: string; name: string; content: string }>, selectedBrowserIds?: string[]) => {
-    if (!id) return;
-    // Sending a message is a clear intent signal: the user wants to see
-    // the response. Force-scroll to bottom regardless of isAtBottomRef.
-    scrollToBottom();
-    const msg: QueuedMessage = { prompt, images, contextPaths, forcedTools, attachedSkills, selectedBrowserIds };
-    if (agentBusy) {
-      messageQueueRef.current.push(msg);
-      setQueueLength(messageQueueRef.current.length);
-      return;
-    }
-    dispatchMessage(msg);
-  };
+  // useCallback so ChatInput's memo equality holds across AgentChat
+  // re-renders driven by unrelated session state. Captures agentBusy
+  // through the dependency so a stale "busy" closure doesn't ever route
+  // a message past the queue.
+  const handleSend = useCallback(
+    (
+      prompt: string,
+      images?: Array<{ data: string; media_type: string }>,
+      contextPaths?: Array<{ path: string; type: 'file' | 'directory' }>,
+      forcedTools?: string[],
+      attachedSkills?: Array<{ id: string; name: string; content: string }>,
+      selectedBrowserIds?: string[],
+    ) => {
+      if (!id) return;
+      scrollToBottom();
+      const msg: QueuedMessage = { prompt, images, contextPaths, forcedTools, attachedSkills, selectedBrowserIds };
+      if (agentBusy) {
+        messageQueueRef.current.push(msg);
+        setQueueLength(messageQueueRef.current.length);
+        return;
+      }
+      dispatchMessage(msg);
+    },
+    [id, scrollToBottom, agentBusy, dispatchMessage],
+  );
 
   const handleModeChange = useCallback((newMode: string) => {
     setMode(newMode);
@@ -485,10 +507,10 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
     dispatch(handleApproval({ requestId, behavior: 'deny', message }));
   };
 
-  const handleStop = () => {
+  const handleStop = useCallback(() => {
     if (!id) return;
     dispatch(stopAgent({ sessionId: id }));
-  };
+  }, [id, dispatch]);
 
   const handleResume = useCallback(() => {
     if (!id) return;
@@ -609,15 +631,14 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
     for (const msg of activeBranchMessages) {
       totalChars += stringifyContent(msg.content).length;
     }
-    if (session?.streamingMessage) {
-      totalChars += (session.streamingMessage.content || '').length;
-    }
     const used = Math.round(totalChars / 4);
     return { used, limit };
-    // Depending on streamingMessage.id (not .content) recomputes once per
-    // turn instead of per painted character. The header pct gauge would
-    // otherwise re-run a full-message length sum every animation frame.
-  }, [activeBranchMessages, session?.system_prompt, session?.streamingMessage?.id, model, modelsByProvider]);
+    // Streaming content's contribution to the context estimate is no
+    // longer included here: we'd have to subscribe to the streaming
+    // text and re-run this sum on every painted character, defeating
+    // the whole point of isolating AgentChat from delta updates. The
+    // header gauge will catch up when stream_end commits the message.
+  }, [activeBranchMessages, session?.system_prompt, streamingMessageId, model, modelsByProvider]);
 
   const sessionRunning = session?.status === 'running' || session?.status === 'waiting_approval';
 
@@ -1119,7 +1140,7 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
                 </Box>
               );
             })()}
-            {renderItems.filter((item) => !session.streamingMessage || item.id !== session.streamingMessage.id).map((item) => {
+            {renderItems.filter((item) => !streamingMessageId || item.id !== streamingMessageId).map((item) => {
               const isCompactionAnchor = !!session.compacted_through_msg_id && item.id === session.compacted_through_msg_id;
               const compactionChip = isCompactionAnchor ? (
                 <CompactionMarker
@@ -1209,39 +1230,15 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
                 </Box>
               );
             })}
-            {session.streamingMessage && (
-              session.streamingMessage.role === 'tool_call' ? (
-                <ToolCallBubble
-                  key={`streaming-${session.streamingMessage.id}`}
-                  isStreaming
-                  isPending
-                  sessionId={session.id}
-                  call={{
-                    id: session.streamingMessage.id,
-                    role: 'tool_call',
-                    content: { tool: session.streamingMessage.tool_name || '', input: session.streamingMessage.content },
-                    timestamp: new Date().toISOString(),
-                    branch_id: session.active_branch_id || 'main',
-                    parent_id: null,
-                  }}
-                />
-              ) : (
-                <MessageBubble
-                  key={`streaming-${session.streamingMessage.id}`}
-                  isStreaming
-                  dynamicTurnLabel={session.turn_label?.label}
-                  message={{
-                    id: session.streamingMessage.id,
-                    role: session.streamingMessage.role,
-                    content: session.streamingMessage.content,
-                    timestamp: new Date().toISOString(),
-                    branch_id: session.active_branch_id || 'main',
-                    parent_id: null,
-                  }}
-                />
-              )
+            {id && (
+              <StreamingBubble
+                sessionId={id}
+                activeBranchId={session.active_branch_id || 'main'}
+                turnLabel={session.turn_label?.label}
+                onStreamGrew={stickToBottomIfNeeded}
+              />
             )}
-            {(awaitingResponse || (session.status === 'running' && !session.streamingMessage)) && (
+            {(awaitingResponse || (session.status === 'running' && !streamingMessageId)) && (
               <ThinkingBubble
                 label={session.turn_label?.label}
                 seedKey={`${session.id}:${session.messages?.length ?? 0}`}

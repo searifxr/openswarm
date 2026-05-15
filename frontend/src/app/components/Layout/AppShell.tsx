@@ -38,6 +38,7 @@ import Dashboard from '@/app/pages/Dashboard/Dashboard';
 import DashboardHost from '@/app/components/Layout/DashboardHost';
 import { useLastDashboardId } from '@/shared/hooks/useLastDashboardId';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
+import { shallowEqual } from 'react-redux';
 import { fetchDashboards, createDashboard, renameDashboard } from '@/shared/state/dashboardsSlice';
 import { setPendingFocusAgentId } from '@/shared/state/tempStateSlice';
 import { addBrowserCard, addBrowserTab } from '@/shared/state/dashboardLayoutSlice';
@@ -163,13 +164,29 @@ const AppShell: React.FC = () => {
     (window as any).openswarm?.installUpdate();
   }, [installing, dispatch]);
 
-  const dashboardItems = useAppSelector((state) => state.dashboards.items);
-  const dashboardList = Object.values(dashboardItems).sort(
-    (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+  // Whole-dict subscriptions are deceptively expensive: `state.dashboards.items`
+  // and `state.outputs.items` are top-level dicts that get a NEW reference
+  // on any nested mutation (RTK/Immer behavior). With default referential
+  // equality, AppShell re-rendered on every dashboard rename, every output
+  // bump, every settings refresh that touched these slices, even though
+  // the dict CONTENTS were structurally identical from AppShell's POV.
+  // shallowEqual compares one level deep (key set + each value's identity),
+  // so AppShell now only re-renders on real structural changes.
+  const dashboardItems = useAppSelector(
+    (state) => state.dashboards.items,
+    shallowEqual,
+  );
+  const dashboardList = React.useMemo(
+    () => Object.values(dashboardItems).sort(
+      (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+    ),
+    [dashboardItems],
   );
 
-  const outputItems = useAppSelector((state) => state.outputs.items);
-  // memo so the sort doesn't re-run on every AppShell re-render.
+  const outputItems = useAppSelector(
+    (state) => state.outputs.items,
+    shallowEqual,
+  );
   const appsList = React.useMemo(
     () => Object.values(outputItems).sort(
       (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
@@ -862,6 +879,13 @@ const AppShell: React.FC = () => {
                       key={item.path}
                       data-onboarding={item.onboarding}
                       onClick={() => navigate(item.path)}
+                      onMouseEnter={() => {
+                        // Hover-prefetch the lazy chunk so the click pays
+                        // ~0ms instead of the multi-hundred-ms chunk parse.
+                        // See Main.tsx for the path → import map.
+                        const fn = (window as any).__openswarmPrefetchRoute;
+                        if (typeof fn === 'function') fn(item.path);
+                      }}
                       sx={{
                         display: 'flex',
                         alignItems: 'center',
@@ -911,6 +935,10 @@ const AppShell: React.FC = () => {
           <Box sx={{ px: 1, mb: 0.25 }}>
             <ListItemButton
               onClick={handleAppsClick}
+              onMouseEnter={() => {
+                const fn = (window as any).__openswarmPrefetchRoute;
+                if (typeof fn === 'function') fn('/apps');
+              }}
               data-onboarding="sidebar-apps"
               sx={{
                 borderRadius: 1.5,

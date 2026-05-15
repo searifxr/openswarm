@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo, RefObject } from 'react';
+import { setCanvasInteractionActive } from '@/shared/canvasInteractionState';
 
 const MIN_ZOOM = 0.15;
 const MAX_ZOOM = 3.0;
@@ -195,6 +196,13 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     let pendingZoomDy = 0;
     let pendingZoomCenter: { cx: number; cy: number } | null = null;
     let wheelRafId: number | null = null;
+    // Trackpad wheel gestures don't have a "gestureend" event; we infer
+    // it from idle time. ~140ms after the last wheel event we declare
+    // the gesture over and unset the interaction flag, which un-pauses
+    // ResizeObservers etc. The 140ms window is short enough to feel
+    // responsive on re-engage and long enough to absorb the inter-burst
+    // gaps inside a continuous swipe.
+    let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const flushWheel = () => {
       wheelRafId = null;
@@ -224,6 +232,15 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     };
 
     const scheduleWheelFlush = () => {
+      // Mark the canvas as actively-interacting and (re)arm the idle
+      // timer. Any ResizeObserver / streaming reconciler that checks the
+      // flag will bail until the user's gesture goes quiet for ~140ms.
+      setCanvasInteractionActive(true);
+      if (wheelIdleTimer != null) clearTimeout(wheelIdleTimer);
+      wheelIdleTimer = setTimeout(() => {
+        wheelIdleTimer = null;
+        setCanvasInteractionActive(false);
+      }, 140);
       if (wheelRafId != null) return;
       wheelRafId = requestAnimationFrame(flushWheel);
     };
@@ -347,6 +364,9 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
       el.removeEventListener('wheel', onWheel);
       window.removeEventListener('openswarm:canvas-wheel-zoom', onForwardedZoom);
       if (wheelRafId != null) cancelAnimationFrame(wheelRafId);
+      if (wheelIdleTimer != null) clearTimeout(wheelIdleTimer);
+      // Don't leave the flag stuck on if the canvas unmounts mid-gesture.
+      setCanvasInteractionActive(false);
     };
   }, [enabled]);
 
@@ -355,6 +375,7 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     cancelAnimation();
     cancelInertia();
     setIsPanning(true);
+    setCanvasInteractionActive(true);
     velocityHistoryRef.current = [{ x: e.clientX, y: e.clientY, t: performance.now() }];
     panStartRef.current = {
       x: e.clientX,
@@ -434,6 +455,7 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
     }
     panStartRef.current = null;
     setIsPanning(false);
+    setCanvasInteractionActive(false);
     // Only spring back if we were actually panning (not on simple clicks)
     if (wasPanning && !didInertia) {
       springBackIfNeeded();
@@ -446,6 +468,7 @@ export function useCanvasControls(zoomSensitivity: number = 50, contentBounds?: 
       if (panStartRef.current) {
         panStartRef.current = null;
         setIsPanning(false);
+        setCanvasInteractionActive(false);
       }
     };
     window.addEventListener('mouseup', onUp);

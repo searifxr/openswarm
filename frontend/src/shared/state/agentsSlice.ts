@@ -54,12 +54,9 @@ export interface MessageBranch {
   created_at: string;
 }
 
-export interface StreamingMessage {
-  id: string;
-  role: 'assistant' | 'tool_call' | 'thinking';
-  content: string;
-  tool_name?: string;
-}
+// StreamingMessage type moved to streamingSlice. Import from there if you
+// need the shape directly.
+export type { StreamingMessage } from './streamingSlice';
 
 export interface ToolGroupMeta {
   id: string;
@@ -89,7 +86,10 @@ export interface AgentSession {
   pending_approvals: ApprovalRequest[];
   branches: Record<string, MessageBranch>;
   active_branch_id: string;
-  streamingMessage: StreamingMessage | null;
+  // streamingMessage lives in `state.streaming.bySession[id]` now;
+  // read it via the selectors in streamingSlice. Kept off this type so
+  // that any reader still trying to access it gets a compile error and
+  // is migrated to the new location.
   target_directory?: string | null;
   tool_group_meta: Record<string, ToolGroupMeta>;
   dashboard_id?: string;
@@ -543,7 +543,6 @@ const agentsSlice = createSlice({
           pending_approvals: [],
           branches: { main: { id: 'main', parent_branch_id: null, fork_point_message_id: null, created_at: new Date().toISOString() } },
           active_branch_id: 'main',
-          streamingMessage: null,
           target_directory: targetDirectory || null,
           tool_group_meta: {},
           thinking_level: thinkingLevel,
@@ -660,7 +659,6 @@ const agentsSlice = createSlice({
       state.sessions[action.payload.id] = {
         ...action.payload,
         pending_approvals: mergedApprovals,
-        streamingMessage: existing?.streamingMessage ?? action.payload.streamingMessage ?? null,
         tool_group_meta: { ...existing?.tool_group_meta, ...action.payload.tool_group_meta },
       };
       if (action.payload.status === 'running' && !state.trackedNotificationIds.includes(action.payload.id)) {
@@ -712,9 +710,8 @@ const agentsSlice = createSlice({
         );
         if (optIdx >= 0) {
           session.messages[optIdx] = { ...incoming, optimistic_status: undefined };
-          if (session.streamingMessage?.id === incoming.id) {
-            session.streamingMessage = null;
-          }
+          // streamingMessage cleanup is handled by streamingSlice's
+          // extraReducers listening to this action.
           return;
         }
       }
@@ -724,9 +721,7 @@ const agentsSlice = createSlice({
       } else {
         session.messages.push(incoming);
       }
-      if (session.streamingMessage?.id === incoming.id) {
-        session.streamingMessage = null;
-      }
+      // streamingMessage cleanup is handled by streamingSlice's extraReducers.
     },
 
     // Synchronous "you sent a message" bubble dispatched from the
@@ -810,40 +805,12 @@ const agentsSlice = createSlice({
       session.turn_label = null;
     },
 
-    streamStart(
-      state,
-      action: PayloadAction<{ sessionId: string; messageId: string; role: 'assistant' | 'tool_call' | 'thinking'; toolName?: string }>
-    ) {
-      const session = state.sessions[action.payload.sessionId];
-      if (session) {
-        session.streamingMessage = {
-          id: action.payload.messageId,
-          role: action.payload.role,
-          content: '',
-          tool_name: action.payload.toolName,
-        };
-      }
-    },
-
-    streamDelta(
-      state,
-      action: PayloadAction<{ sessionId: string; messageId: string; delta: string }>
-    ) {
-      const session = state.sessions[action.payload.sessionId];
-      if (session?.streamingMessage?.id === action.payload.messageId) {
-        session.streamingMessage.content += action.payload.delta;
-      }
-    },
-
-    streamEnd(
-      state,
-      action: PayloadAction<{ sessionId: string; messageId: string }>
-    ) {
-      const session = state.sessions[action.payload.sessionId];
-      if (session?.streamingMessage?.id === action.payload.messageId) {
-        session.streamingMessage = null;
-      }
-    },
+    // streamStart / streamDelta / streamEnd live in streamingSlice now.
+    // Mutating per-character on `session.streamingMessage` previously
+    // changed the top-level `sessions` dict reference 30Hz × N agents,
+    // forcing Dashboard (subscribed to sessions) to re-render at the same
+    // rate. Keeping the streaming text in a separate slice keeps the
+    // sessions dict stable during streaming.
 
     addApprovalRequest(
       state,
@@ -1095,7 +1062,6 @@ const agentsSlice = createSlice({
             pending_approvals: existing?.pending_approvals?.length
               ? existing.pending_approvals
               : s.pending_approvals ?? [],
-            streamingMessage: existing?.streamingMessage ?? s.streamingMessage ?? null,
             tool_group_meta: { ...existing?.tool_group_meta, ...s.tool_group_meta },
           };
           if (activeStatuses.has(s.status) && !state.trackedNotificationIds.includes(s.id)) {
@@ -1107,7 +1073,7 @@ const agentsSlice = createSlice({
         state.loading = false;
       })
       .addCase(launchAgent.fulfilled, (state, action) => {
-        state.sessions[action.payload.id] = { ...action.payload, streamingMessage: null, tool_group_meta: action.payload.tool_group_meta ?? {} };
+        state.sessions[action.payload.id] = { ...action.payload, tool_group_meta: action.payload.tool_group_meta ?? {} };
         state.activeSessionId = action.payload.id;
         if (!state.expandedSessionIds.includes(action.payload.id)) {
           state.expandedSessionIds.push(action.payload.id);
@@ -1120,7 +1086,7 @@ const agentsSlice = createSlice({
         const { draftId, session } = action.payload;
         const shouldExpand = action.meta.arg.expand !== false;
         delete state.sessions[draftId];
-        state.sessions[session.id] = { ...session, streamingMessage: null, tool_group_meta: session.tool_group_meta ?? {} };
+        state.sessions[session.id] = { ...session, tool_group_meta: session.tool_group_meta ?? {} };
         state.activeSessionId = session.id;
         state.draftLaunchMap[draftId] = session.id;
         state.expandedSessionIds = state.expandedSessionIds.map((id) => (id === draftId ? session.id : id));
@@ -1170,8 +1136,11 @@ const agentsSlice = createSlice({
         const session = state.sessions[action.payload];
         if (session) {
           session.status = 'stopped';
-          session.streamingMessage = null;
           session.pending_approvals = [];
+          // streamingMessage cleanup is handled by streamingSlice via
+          // clearStreamingForSession. We dispatch it explicitly here
+          // because stopAgent.fulfilled isn't one of the action types
+          // we listen for in streamingSlice's extraReducers.
         }
       })
       .addCase(handleApproval.fulfilled, (state, action) => {
@@ -1261,7 +1230,7 @@ const agentsSlice = createSlice({
       })
       .addCase(resumeSession.fulfilled, (state, action) => {
         const session = action.payload;
-        state.sessions[session.id] = { ...session, streamingMessage: null, tool_group_meta: session.tool_group_meta ?? {} };
+        state.sessions[session.id] = { ...session, tool_group_meta: session.tool_group_meta ?? {} };
         delete state.history[session.id];
         state.activeSessionId = session.id;
         if (!state.expandedSessionIds.includes(session.id)) {
@@ -1282,7 +1251,6 @@ const agentsSlice = createSlice({
         state.sessions[session.id] = {
           ...session,
           pending_approvals: session.pending_approvals ?? existing?.pending_approvals ?? [],
-          streamingMessage: existing?.streamingMessage ?? null,
           tool_group_meta: session.tool_group_meta ?? existing?.tool_group_meta ?? {},
         };
       })
@@ -1310,7 +1278,6 @@ const agentsSlice = createSlice({
           if (!state.sessions[session.id]) {
             state.sessions[session.id] = {
               ...session,
-              streamingMessage: null,
               tool_group_meta: session.tool_group_meta ?? {},
             };
           }
@@ -1358,9 +1325,6 @@ export const {
   recordCompaction,
   setTurnLabel,
   clearTurnLabel,
-  streamStart,
-  streamDelta,
-  streamEnd,
   addApprovalRequest,
   removeApprovalRequest,
   updateSessionCost,

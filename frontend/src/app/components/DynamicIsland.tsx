@@ -14,6 +14,9 @@ import PanToolOutlinedIcon from '@mui/icons-material/PanToolOutlined';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
+import { shallowEqual } from 'react-redux';
+import { createSelector } from '@reduxjs/toolkit';
+import type { RootState } from '@/shared/state/store';
 import {
   handleApproval,
   stopAgent,
@@ -191,6 +194,67 @@ const ActivityIndicator: React.FC<{ c: ReturnType<typeof useClaudeTokens> }> = (
 );
 
 // ---------------------------------------------------------------------------
+// Memoized session projection
+// ---------------------------------------------------------------------------
+//
+// DynamicIsland only reads name / status / dashboard_id / pending_approvals
+// per session. We project to a stable shape so identity persists across
+// streamingMessage deltas (which mutate state.streaming, not state.agents,
+// but still trigger Immer to swap the agents root reference any time
+// agentsSlice runs (fine in theory, but selector consumers re-fire).
+//
+// Per-session cache: when a session's relevant fields haven't moved,
+// return the SAME inner object reference, so the outer dict can be
+// dropped on shallowEqual if its key set + per-session refs match.
+
+type DiSession = {
+  id: string;
+  name: string;
+  status: string;
+  dashboard_id?: string;
+  pending_approvals: AgentSession['pending_approvals'];
+};
+
+const _diSessionCache: Map<string, DiSession> = new Map();
+
+const selectDynamicIslandSessions = createSelector(
+  [(s: RootState) => s.agents.sessions],
+  (raw) => {
+    const out: Record<string, DiSession> = {};
+    const liveIds = new Set<string>();
+    for (const [sid, s] of Object.entries(raw)) {
+      liveIds.add(sid);
+      const prev = _diSessionCache.get(sid);
+      if (
+        prev
+        && prev.name === s.name
+        && prev.status === s.status
+        && prev.dashboard_id === s.dashboard_id
+        && prev.pending_approvals === s.pending_approvals
+      ) {
+        out[sid] = prev;
+      } else {
+        const next: DiSession = {
+          id: sid,
+          name: s.name,
+          status: s.status,
+          dashboard_id: s.dashboard_id,
+          pending_approvals: s.pending_approvals,
+        };
+        _diSessionCache.set(sid, next);
+        out[sid] = next;
+      }
+    }
+    // Evict cache entries for sessions that disappeared. Without this,
+    // long sessions of dashboard switching slowly accumulate dead refs.
+    for (const cached of _diSessionCache.keys()) {
+      if (!liveIds.has(cached)) _diSessionCache.delete(cached);
+    }
+    return out;
+  },
+);
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -200,9 +264,19 @@ const DynamicIsland: React.FC = () => {
   const navigate = useNavigate();
   const islandRef = useRef<HTMLDivElement>(null);
 
-  const sessions = useAppSelector((state) => state.agents.sessions);
-  const history = useAppSelector((state) => state.agents.history);
-  const trackedIds = useAppSelector((state) => state.agents.trackedNotificationIds);
+  // Read the whole sessions dict, but memoize its projection so the
+  // useSelector only emits a new value when one of the four fields we
+  // actually consume (name/status/dashboard_id/pending_approvals)
+  // changes for SOME session. createSelector caches both the inner
+  // per-session shape AND the outer dict, so re-runs return the same
+  // reference when nothing relevant moved, even though Immer flips
+  // the top-level dict ref on every streamed character elsewhere.
+  // shallowEqual: createSelector returns a fresh outer dict object on
+  // each re-run, but the inner refs are cached so when nothing relevant
+  // moved, key-by-key comparison short-circuits the re-render.
+  const sessions = useAppSelector(selectDynamicIslandSessions, shallowEqual);
+  const history = useAppSelector((state) => state.agents.history, shallowEqual);
+  const trackedIds = useAppSelector((state) => state.agents.trackedNotificationIds, shallowEqual);
 
   const [userExpanded, setUserExpanded] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);

@@ -32,6 +32,8 @@ import { parseMcpToolName, getMcpShortAction } from '@/app/pages/AgentChat/ToolC
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import { useDashboardActive } from '@/shared/hooks/useDashboardActive';
 import { useOverlayScrollPassthrough } from './useOverlayScrollPassthrough';
+import { useStreamingMessage } from '@/shared/state/streamingSlice';
+import { isCanvasInteractionActive, onCanvasInteractionEnd } from '@/shared/canvasInteractionState';
 
 // ---------------------------------------------------------------------------
 // Helper components & functions (unchanged)
@@ -79,6 +81,23 @@ function fmtSeconds(seconds: number): string {
   const hours = Math.floor(minutes / 60);
   return `${hours}h ${minutes % 60}m`;
 }
+
+// Self-ticking elapsed-time renderer. Owns its own 1Hz interval so only
+// this leaf re-renders per second while a session is active; the rest
+// of AgentCard stays put. Memoized on `status` + `messages` so it
+// doesn't re-tick after the session goes terminal.
+const ElapsedTimer: React.FC<{
+  messages: Array<{ role: string; timestamp: string; elapsed_ms?: number; hidden?: boolean }>;
+  status: string;
+}> = React.memo(({ messages, status }) => {
+  const [, setTick] = React.useState(0);
+  React.useEffect(() => {
+    if (status !== 'running' && status !== 'waiting_approval') return;
+    const id = setInterval(() => setTick((t) => (t + 1) & 0xffff), 1000);
+    return () => clearInterval(id);
+  }, [status]);
+  return <>{fmtSeconds(getAgentWorkTime(messages, status).last)}</>;
+});
 
 function getAgentWorkTime(
   messages: Array<{ role: string; timestamp: string; elapsed_ms?: number; hidden?: boolean }>,
@@ -322,16 +341,35 @@ const AgentCard: React.FC<Props> = ({
   useEffect(() => {
     const el = cardBoxRef.current;
     if (!el || !onMeasuredHeight) return;
+    // Remember the most recent height seen during a suppressed window
+    // (pan/drag/zoom in progress). When the interaction ends, fire it
+    // through so the layout reconciles to the truth right then.
+    let suppressedHeight: number | null = null;
     const ro = new ResizeObserver((entries) => {
       // Short-circuit when dashboard is hidden — observer stays attached so
       // the next resize after returning to the dashboard fires correctly.
       if (!isDashboardActiveRef.current) return;
+      // Short-circuit during active canvas interaction (pan/drag/wheel).
+      // During those gestures we don't care about millimeter-precise card
+      // heights; re-measuring on every streamed character was forcing
+      // Dashboard re-renders mid-pan via setMeasuredHeightsTick. Stash
+      // the latest height instead and flush on gesture end.
+      if (isCanvasInteractionActive()) {
+        for (const entry of entries) suppressedHeight = entry.contentRect.height;
+        return;
+      }
       for (const entry of entries) {
         onMeasuredHeight(session.id, entry.contentRect.height);
       }
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    const unsub = onCanvasInteractionEnd(() => {
+      if (suppressedHeight != null && isDashboardActiveRef.current) {
+        onMeasuredHeight(session.id, suppressedHeight);
+      }
+      suppressedHeight = null;
+    });
+    return () => { ro.disconnect(); unsub(); };
   }, [session.id, onMeasuredHeight]);
 
   // ---- Glow state (for branched cards) ----
@@ -364,7 +402,6 @@ const AgentCard: React.FC<Props> = ({
     draft: { color: c.accent.primary, bg: c.bg.secondary },
   };
 
-  const [, setTick] = useState(0);
   const isDraft = session.status === 'draft';
 
   // ---- Drag via header (pointer events) ----
@@ -557,19 +594,20 @@ const AgentCard: React.FC<Props> = ({
   };
 
 
-  useEffect(() => {
-    if (session.status === 'running' || session.status === 'waiting_approval') {
-      const interval = setInterval(() => setTick((t) => t + 1), 1000);
-      return () => clearInterval(interval);
-    }
-  }, [session.status]);
+  // Elapsed-time display owns its own 1Hz tick via <ElapsedTimer/> below;
+  // we don't force-re-render the whole 1000+ line AgentCard every second
+  // anymore (each card running × 1Hz = wasted reconciliation budget).
 
   const lastMessage = session.messages[session.messages.length - 1];
-  const isStreaming = !!session.streamingMessage;
+  // Subscribe to this card's own streaming entry from the streaming
+  // slice. Per-character mutations no longer churn the sessions dict,
+  // so other cards stay stable while this one streams.
+  const streamingMessage = useStreamingMessage(session.id);
+  const isStreaming = !!streamingMessage;
   const previewContent = isStreaming
-    ? (session.streamingMessage!.role === 'tool_call'
-        ? `[${getToolDisplayName(session.streamingMessage!.tool_name || '')}] ${session.streamingMessage!.content}`
-        : session.streamingMessage!.content
+    ? (streamingMessage!.role === 'tool_call'
+        ? `[${getToolDisplayName(streamingMessage!.tool_name || '')}] ${streamingMessage!.content}`
+        : streamingMessage!.content
       ).slice(0, 120)
     : lastMessage && typeof lastMessage.content === 'string'
       ? lastMessage.content.slice(0, 120)
@@ -985,7 +1023,7 @@ const AgentCard: React.FC<Props> = ({
             {session.mode}
           </Typography>
           <Typography variant="caption" sx={{ color: c.text.tertiary }}>
-            {fmtSeconds(getAgentWorkTime(session.messages, session.status).last)}
+            <ElapsedTimer messages={session.messages} status={session.status} />
           </Typography>
           {session.cost_usd > 0 && hasApiKey && (
             <Typography variant="caption" sx={{ color: c.accent.primary }}>

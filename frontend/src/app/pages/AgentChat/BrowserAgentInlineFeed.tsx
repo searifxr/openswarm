@@ -20,8 +20,10 @@ import AccountTreeOutlinedIcon from '@mui/icons-material/AccountTreeOutlined';
 import CodeOutlinedIcon from '@mui/icons-material/CodeOutlined';
 import BuildOutlinedIcon from '@mui/icons-material/BuildOutlined';
 import { createSelector } from '@reduxjs/toolkit';
+import { shallowEqual } from 'react-redux';
 import { useAppSelector, useAppDispatch } from '@/shared/hooks';
 import { AgentMessage, AgentSession, fetchBrowserAgentChildren, handleApproval } from '@/shared/state/agentsSlice';
+import type { StreamingMessage } from '@/shared/state/streamingSlice';
 import { useClaudeTokens, useThemeMode } from '@/shared/styles/ThemeContext';
 import type { RootState } from '@/shared/state/store';
 
@@ -150,6 +152,11 @@ const lightFeedColors: FeedColors = {
   scrollThumb: '#ccc9c0',
 };
 
+// Stable empty-object reference for the streaming selector to return
+// when there are no browser sessions yet; keeps shallowEqual happy
+// across renders so we don't churn on an "empty" dict literal.
+const EMPTY_STREAMING: Record<string, StreamingMessage> = Object.freeze({}) as Record<string, StreamingMessage>;
+
 const selectBrowserSessions = createSelector(
   [(state: RootState) => state.agents.sessions,
    (_: RootState, parentSessionId: string) => parentSessionId,
@@ -174,6 +181,28 @@ const BrowserAgentInlineFeed: React.FC<Props> = ({ parentSessionId, browserId })
   const browserSessions = useAppSelector((state) =>
     selectBrowserSessions(state, parentSessionId, browserId),
   );
+  // Subscribe to only the streaming entries that belong to THIS feed's
+  // browser sessions. Previously this read the full bySession dict,
+  // which re-rendered the feed on every streamed character from every
+  // agent on the dashboard, which was the "glitching when agent is
+  // using the browser" experience. With shallowEqual we only re-render
+  // when one of our specific browser sessions actually gets a delta.
+  const browserSessionIds = useMemo(
+    () => browserSessions.map((s) => s.id).sort().join(','),
+    [browserSessions],
+  );
+  const streamingBySession = useAppSelector(
+    (state) => {
+      if (!browserSessionIds) return EMPTY_STREAMING;
+      const out: Record<string, StreamingMessage> = {};
+      for (const id of browserSessionIds.split(',')) {
+        const entry = state.streaming.bySession[id];
+        if (entry) out[id] = entry;
+      }
+      return out;
+    },
+    shallowEqual,
+  );
 
   useEffect(() => {
     if (browserSessions.length === 0 && fetchedForSession.current !== parentSessionId) {
@@ -191,15 +220,16 @@ const BrowserAgentInlineFeed: React.FC<Props> = ({ parentSessionId, browserId })
         const entry = formatMessage(msg);
         if (entry) entries.push(entry);
       }
-      if (session.streamingMessage?.role === 'assistant' && session.streamingMessage.content) {
-        entries.push({ type: 'thought', text: session.streamingMessage.content });
+      const stream: StreamingMessage | undefined = streamingBySession[session.id];
+      if (stream?.role === 'assistant' && stream.content) {
+        entries.push({ type: 'thought', text: stream.content });
       }
       return { session, entries };
     });
-  }, [browserSessions]);
+  }, [browserSessions, streamingBySession]);
 
   const totalMessages = browserSessions.reduce(
-    (n, s) => n + s.messages.length + (s.streamingMessage ? 1 : 0),
+    (n, s) => n + s.messages.length + (streamingBySession[s.id] ? 1 : 0),
     0,
   );
 

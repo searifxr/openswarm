@@ -14,6 +14,7 @@ import CloseFullscreenIcon from '@mui/icons-material/CloseFullscreen';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import { AgentSession, AgentMessage, stopAgent, handleApproval } from '@/shared/state/agentsSlice';
+import { useStreamingMessage } from '@/shared/state/streamingSlice';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 
@@ -81,6 +82,8 @@ const BrowserAgentOverlay: React.FC<Props> = ({ session, browserWidth, browserHe
 
   const isRunning = session.status === 'running' || session.status === 'waiting_approval';
   const browserDone = session.status === 'completed' || session.status === 'error' || session.status === 'stopped';
+  // Streaming message lives in its own slice; see streamingSlice.ts.
+  const streamingMessage = useStreamingMessage(session.id);
   // Only truly "done" (fade + hide) when the parent is also finished.
   // While the parent is still active, the overlay stays visible in a
   // "waiting for next task" state between sub-tasks.
@@ -130,7 +133,7 @@ const BrowserAgentOverlay: React.FC<Props> = ({ session, browserWidth, browserHe
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [session.messages.length, session.streamingMessage]);
+  }, [session.messages.length, streamingMessage]);
 
   const handleStop = useCallback(() => {
     if (!confirmStop) {
@@ -153,9 +156,8 @@ const BrowserAgentOverlay: React.FC<Props> = ({ session, browserWidth, browserHe
     .map(summarizeMessage)
     .filter((e) => e.type !== 'skip' && e.type !== 'result');
 
-  const streamingMsg = session.streamingMessage;
-  if (streamingMsg && streamingMsg.role === 'assistant' && streamingMsg.content) {
-    entries.push({ type: 'thought', text: streamingMsg.content });
+  if (streamingMessage && streamingMessage.role === 'assistant' && streamingMessage.content) {
+    entries.push({ type: 'thought', text: streamingMessage.content });
   }
 
   const collapsedW = Math.min(300, browserWidth - 24);

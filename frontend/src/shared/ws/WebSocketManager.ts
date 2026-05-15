@@ -5,9 +5,6 @@ import {
   updateSessionName,
   updateGroupMeta,
   addMessage,
-  streamStart,
-  streamDelta,
-  streamEnd,
   addApprovalRequest,
   removeApprovalRequest,
   updateSessionStatus,
@@ -25,6 +22,7 @@ import {
   setTurnLabel,
   clearTurnLabel,
 } from '../state/agentsSlice';
+import { streamStart, streamDelta, streamEnd } from '../state/streamingSlice';
 import { addBrowserCardFromBackend, removeBrowserCard, setBrowserCardPosition, setGlowingBrowserCards, GRID_GAP } from '../state/dashboardLayoutSlice';
 import { getAuthToken } from '../config';
 import { notifyAgentCompletion } from '../notifications';

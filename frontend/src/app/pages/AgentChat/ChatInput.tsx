@@ -90,6 +90,12 @@ export interface AttachedImage {
   data: string;
   media_type: string;
   preview: string;
+  // Set by addImageFiles when we use URL.createObjectURL for the preview
+  // instead of a data URL. handleSend reads this with FileReader at
+  // send time so we don't carry the full base64 in memory between
+  // attach and send. Falls back to base64 conversion of the data URL
+  // if the file is missing (e.g. paste-from-clipboard with raw base64).
+  _file?: File;
 }
 
 export interface ForcedToolGroup {
@@ -663,6 +669,18 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   }), [c]);
 
   const [images, setImages] = useState<AttachedImage[]>([]);
+  // Track current images via ref so the unmount cleanup sees the latest
+  // list (not the empty-array snapshot from the effect's first run) and
+  // can revoke any outstanding blob: preview URLs.
+  const imagesRef = useRef(images);
+  imagesRef.current = images;
+  useEffect(() => () => {
+    for (const img of imagesRef.current) {
+      if (img.preview?.startsWith('blob:')) {
+        try { URL.revokeObjectURL(img.preview); } catch { /* nothing */ }
+      }
+    }
+  }, []);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -773,18 +791,19 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   }, []);
 
   const addImageFiles = useCallback((files: FileList | File[]) => {
+    // Two-stage: thumbnail / lightbox preview comes from a blob: URL
+    // (kept by the browser as a binary file handle, not a JS string),
+    // and the base64 only materializes asynchronously for the actual
+    // send payload. Holding only the blob URL keeps a ~2MB screenshot
+    // attachment from also costing ~2.7MB of JS heap as a data URL.
+    // The base64 promise is awaited inside handleSend.
     Array.from(files).forEach((file) => {
       if (!file.type.startsWith('image/')) return;
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        const base64 = result.split(',')[1];
-        setImages((prev) => [
-          ...prev,
-          { data: base64, media_type: file.type, preview: result },
-        ]);
-      };
-      reader.readAsDataURL(file);
+      const previewUrl = URL.createObjectURL(file);
+      setImages((prev) => [
+        ...prev,
+        { data: '', media_type: file.type, preview: previewUrl, _file: file } as AttachedImage,
+      ]);
     });
   }, []);
 
@@ -847,9 +866,31 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     }
 
     const selectedEls = elementSelection?.elementsByOwner?.[ownerId] ?? [];
-    let allImages = images.length > 0
-      ? images.map(({ data, media_type }) => ({ data, media_type }))
-      : [];
+    // Materialize image base64 at send time so we don't keep ~2.7MB
+    // strings in component state for every attached screenshot. Images
+    // added via addImageFiles carry a File reference (_file) and read
+    // their bytes on demand; legacy paste flows that wrote `data`
+    // directly still work. FileReader is async, so this is a Promise.all.
+    let allImages: Array<{ data: string; media_type: string }> = [];
+    if (images.length > 0) {
+      allImages = await Promise.all(images.map(async (img) => {
+        if (img.data) return { data: img.data, media_type: img.media_type };
+        if (img._file) {
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+              const r = reader.result as string;
+              resolve(r.split(',')[1] ?? '');
+            };
+            reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+            reader.readAsDataURL(img._file!);
+          });
+          return { data: base64, media_type: img.media_type };
+        }
+        return { data: '', media_type: img.media_type };
+      }));
+      allImages = allImages.filter((i) => i.data);
+    }
 
     if (selectedEls.length > 0) {
       const lines: string[] = ['\n\n---\nSelected UI Elements:\n'];
@@ -923,6 +964,13 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     );
     editor.innerHTML = '';
     _draftStore.delete(ownerId);
+    // Revoke any blob: URLs we minted for previews so the underlying
+    // bytes can be freed by the browser.
+    for (const img of images) {
+      if (img.preview?.startsWith('blob:')) {
+        try { URL.revokeObjectURL(img.preview); } catch { /* nothing */ }
+      }
+    }
     setImages([]);
     setContextPaths([]);
     setForcedTools([]);
@@ -1150,7 +1198,16 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   }, [addImageFiles, uploadAndAttachFiles]);
 
   const removeImage = useCallback((idx: number) => {
-    setImages((prev) => prev.filter((_, i) => i !== idx));
+    setImages((prev) => {
+      const removed = prev[idx];
+      // Revoke the blob URL we minted in addImageFiles so the browser
+      // can free the underlying bytes; data URLs have no resource to
+      // revoke so the `blob:` check is sufficient.
+      if (removed?.preview?.startsWith('blob:')) {
+        try { URL.revokeObjectURL(removed.preview); } catch { /* nothing */ }
+      }
+      return prev.filter((_, i) => i !== idx);
+    });
   }, []);
 
   const menuPaperProps = {
@@ -2423,4 +2480,8 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
 
 ChatInput.displayName = 'ChatInput';
 
-export default ChatInput;
+// Memoize across parent re-renders driven by unrelated state (most
+// commonly AgentChat re-rendering because its session-local data
+// updated). The parent passes callbacks via useCallback and primitive
+// props, so the default shallow comparison is correct.
+export default React.memo(ChatInput);

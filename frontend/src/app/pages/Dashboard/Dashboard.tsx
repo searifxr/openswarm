@@ -480,12 +480,28 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
     hasFittedRef.current = false;
     restoredExpandedRef.current = false;
     dispatch(resetLayout());
+    // CRITICAL path: these populate the cards the user expects to see
+    // on first paint. Don't defer.
     dispatch(fetchSessions({ dashboardId }));
-    dispatch(fetchHistory({ dashboardId }));
     dispatch(fetchLayout(dashboardId));
-    dispatch(fetchOutputs());
-    dashboardWs.connect();
     const cleanupBrowserHandler = initBrowserCommandHandler();
+    // DEFERRABLE: history list (for the search palette) and outputs
+    // (for the apps panel) aren't on the first-paint path. Same for the
+    // dashboard WS connection (it carries cross-session events; opens
+    // ~100ms later costs nothing). Pushing these into the post-paint
+    // window measurably improves LCP because the initial render
+    // pipeline isn't competing with their thunks/network setup.
+    const idleHandle = (typeof window !== 'undefined' && (window as any).requestIdleCallback)
+      ? (window as any).requestIdleCallback(() => {
+          dispatch(fetchHistory({ dashboardId }));
+          dispatch(fetchOutputs());
+          dashboardWs.connect();
+        }, { timeout: 2000 })
+      : window.setTimeout(() => {
+          dispatch(fetchHistory({ dashboardId }));
+          dispatch(fetchOutputs());
+          dashboardWs.connect();
+        }, 200);
 
     // Pre-warm Anthropic's prompt cache for sessions on this dashboard
     // ~250ms after mount (debounced; AbortController cancels on
@@ -523,6 +539,13 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
       warmAbort.abort();
       cleanupBrowserHandler();
       dashboardWs.disconnect();
+      // Cancel any not-yet-fired idle work; the cleanup handler can't
+      // run partially if the dashboard switches before idle fired.
+      if (typeof window !== 'undefined') {
+        const cancelIdle = (window as any).cancelIdleCallback;
+        if (cancelIdle && typeof idleHandle === 'number') cancelIdle(idleHandle);
+        else if (typeof idleHandle === 'number') clearTimeout(idleHandle);
+      }
     };
   }, [dispatch, dashboardId]);
 

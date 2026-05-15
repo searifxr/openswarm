@@ -40,6 +40,24 @@ const SignInGate = lazy(() => import('./components/SignInGate'));
 // callback to avoid all six firing at once and contending for network
 // + parse time during first paint.
 if (typeof window !== 'undefined') {
+  // Map sidebar paths to their dynamic imports so a hover/mouseenter on
+  // the sidebar can preload the chunk before the click. By the time the
+  // user actually clicks (~100-300ms after hover), the chunk is parsed
+  // and React.lazy resolves instantly. Exposed on window so AppShell
+  // can call it without prop-drilling. Each entry is idempotent;
+  // webpack dedupes repeated dynamic imports.
+  (window as any).__openswarmPrefetchRoute = (path: string) => {
+    switch (path) {
+      case '/skills': void import('./pages/Skills/Skills'); return;
+      case '/actions':
+      case '/tools': void import('./pages/Tools/Tools'); return;
+      case '/modes': void import('./pages/Modes/Modes'); return;
+      case '/views':
+      case '/apps': void import('./pages/Views/Views'); return;
+      case '/customization': void import('./pages/Customization/Customization'); return;
+      case '/analytics': void import('./pages/Analytics/Analytics'); return;
+    }
+  };
   const prefetchAll = () => {
     void import('./pages/Views/Views');
     void import('./pages/Skills/Skills');
@@ -48,11 +66,17 @@ if (typeof window !== 'undefined') {
     void import('./pages/Customization/Customization');
     void import('./pages/Analytics/Analytics');
   };
+  // Tighter idle deadline (was 4000ms): we WANT these chunks loaded
+  // before the user's first click, so don't let the browser defer them
+  // indefinitely. Fallback timeout reduced from 2000ms to 500ms for the
+  // same reason. The cost during initial render is small (one chunk
+  // parse per route, deferred); the cost of paying it on first click
+  // is a multi-hundred-ms freeze.
   const ric = (window as any).requestIdleCallback as
     | ((cb: () => void, opts?: { timeout?: number }) => number)
     | undefined;
-  if (ric) ric(prefetchAll, { timeout: 4000 });
-  else window.setTimeout(prefetchAll, 2000);
+  if (ric) ric(prefetchAll, { timeout: 1500 });
+  else window.setTimeout(prefetchAll, 500);
 }
 import { report, getSessionTraceState, getRecentActions } from '@/shared/serviceClient';
 import { useRouteTracker } from '@/shared/hooks/useRouteTracker';
