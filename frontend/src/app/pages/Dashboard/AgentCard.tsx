@@ -237,13 +237,9 @@ const HANDLE_DEFS: { dir: ResizeDir; sx: Record<string, any> }[] = [
 // AgentCard
 // ---------------------------------------------------------------------------
 
-interface Props {
-  session: AgentSession;
+interface OuterProps {
+  sessionId: string;
   expanded: boolean;
-  cardX: number;
-  cardY: number;
-  cardWidth: number;
-  cardHeight: number;
   zoom?: number;
   panX?: number;
   panY?: number;
@@ -260,10 +256,18 @@ interface Props {
   onMeasuredHeight?: (sessionId: string, height: number) => void;
   snapColumn?: { x: number; width: number };
   autoFocusInput?: boolean;
-  cardZOrder?: number;
   onDoubleClick?: (id: string, type: 'agent' | 'view' | 'browser') => void;
   onBringToFront?: (id: string, type: 'agent' | 'view' | 'browser') => void;
   shakeDirection?: 'left' | 'right' | 'up' | 'down' | null;
+}
+
+interface Props extends Omit<OuterProps, 'sessionId'> {
+  session: AgentSession;
+  cardX: number;
+  cardY: number;
+  cardWidth: number;
+  cardHeight: number;
+  cardZOrder: number;
 }
 
 const MIN_W = 480;
@@ -1184,4 +1188,27 @@ const AgentCard: React.FC<Props> = ({
   );
 };
 
-export default React.memo(AgentCard);
+const MemoAgentCard = React.memo(AgentCard);
+
+// Self-subscribing outer: this is what Dashboard renders. Each card reads
+// only its own session + card position from Redux, so a streamDelta to
+// session A no longer disturbs B's props. Dashboard's iteration just hands
+// down sessionId + cross-card UI state (selection, drag, glow).
+const AgentCardOuter: React.FC<OuterProps> = (props) => {
+  const session = useAppSelector((s) => s.agents.sessions[props.sessionId]);
+  const cardEntry = useAppSelector((s) => s.dashboardLayout.cards[props.sessionId]);
+  if (!session || !cardEntry) return null;
+  return (
+    <MemoAgentCard
+      {...props}
+      session={session}
+      cardX={cardEntry.x}
+      cardY={cardEntry.y}
+      cardWidth={cardEntry.width}
+      cardHeight={cardEntry.height}
+      cardZOrder={cardEntry.zOrder ?? 0}
+    />
+  );
+};
+
+export default AgentCardOuter;

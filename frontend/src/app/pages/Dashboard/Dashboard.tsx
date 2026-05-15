@@ -1922,16 +1922,15 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
             )}
             <AnimatePresence>
             {Object.values(cards).map((card) => {
-              const session = sessions[card.session_id];
-              if (!session) return null;
+              const sid = card.session_id;
 
-              let origin = spawnOriginsRef.current[session.id];
+              let origin = spawnOriginsRef.current[sid];
               if (origin) {
-                delete spawnOriginsRef.current[session.id];
+                delete spawnOriginsRef.current[sid];
               } else {
-                const glow = glowingAgentCards[session.id];
-                if (glow && !revealSpawnedRef.current.has(session.id)) {
-                  revealSpawnedRef.current.add(session.id);
+                const glow = glowingAgentCards[sid];
+                if (glow && !revealSpawnedRef.current.has(sid)) {
+                  revealSpawnedRef.current.add(sid);
                   const srcCard = cards[glow.sourceId];
                   if (srcCard) {
                     const srcH = measuredHeightsRef.current[glow.sourceId]
@@ -1948,7 +1947,7 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
               }
 
               let exitTarget: { x: number; y: number } | undefined;
-              const glow = glowingAgentCards[session.id];
+              const glow = glowingAgentCards[sid];
               if (glow) {
                 const srcCard = cards[glow.sourceId];
                 if (srcCard) {
@@ -1976,21 +1975,16 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
 
               return (
                 <AgentCard
-                  key={session.id}
-                  session={session}
-                  expanded={expandedSessionIds.includes(session.id)}
-                  cardX={card.x}
-                  cardY={card.y}
-                  cardWidth={card.width}
-                  cardHeight={card.height}
-                  cardZOrder={card.zOrder ?? 0}
+                  key={sid}
+                  sessionId={sid}
+                  expanded={expandedSessionIds.includes(sid)}
                   zoom={canvas.zoom}
                   panX={canvas.panX}
                   panY={canvas.panY}
                   spawnFrom={origin}
                   exitTarget={exitTarget}
-                  isSelected={selection.isSelected(session.id)}
-                  isHighlighted={highlightedCardId === session.id}
+                  isSelected={selection.isSelected(sid)}
+                  isHighlighted={highlightedCardId === sid}
                   multiDragDelta={multiDragDelta}
                   onCardSelect={handleCardSelect}
                   onDragStart={handleCardDragStart}
@@ -1999,10 +1993,10 @@ const DashboardInner: React.FC<DashboardProps> = ({ dashboardId, isActive = true
                   onBranch={handleBranchFromCard}
                   onMeasuredHeight={handleMeasuredHeight}
                   snapColumn={snapColumn}
-                  autoFocusInput={autoFocusSessionId === session.id}
+                  autoFocusInput={autoFocusSessionId === sid}
                   onDoubleClick={handleCardDoubleClick}
                   onBringToFront={handleBringToFront}
-                  shakeDirection={focusedCardId === session.id ? shakeDirection : null}
+                  shakeDirection={focusedCardId === sid ? shakeDirection : null}
                 />
               );
             })}

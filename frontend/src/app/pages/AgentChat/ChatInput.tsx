@@ -131,6 +131,21 @@ export interface ChatInputHandle {
 // sessionId (or a fallback owner id). Stores the raw innerHTML of the
 // contentEditable div so skill pills, formatting, etc. are preserved.
 const _draftStore = new Map<string, string>();
+// Debounce per-owner so we don't read innerHTML (full DOM serialization)
+// on every keystroke. ~200ms is below human "I expected my draft saved"
+// while still coalescing fast typing and giant pastes into one read.
+const _draftDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const DRAFT_DEBOUNCE_MS = 200;
+function scheduleDraftSave(ownerId: string, getHtml: () => string) {
+  const existing = _draftDebounceTimers.get(ownerId);
+  if (existing) clearTimeout(existing);
+  _draftDebounceTimers.set(ownerId, setTimeout(() => {
+    _draftDebounceTimers.delete(ownerId);
+    const html = getHtml();
+    if (html && html !== '<br>') _draftStore.set(ownerId, html);
+    else _draftStore.delete(ownerId);
+  }, DRAFT_DEBOUNCE_MS));
+}
 
 const ICON_MAP: Record<string, React.ReactNode> = {
   smart_toy: <SmartToyOutlinedIcon sx={{ fontSize: 14 }} />,
@@ -925,20 +940,26 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     }
   }, []);
 
+  // Set in handlePaste before execCommand fires the synthetic input event,
+  // so handleInput can skip the heavy post-input scans that paste can't
+  // possibly invalidate (paste never adds skill pills, never starts a
+  // slash/at trigger sequence, and the content is non-empty by definition).
+  const justPastedRef = useRef(false);
+
   const handleInput = useCallback(() => {
+    if (justPastedRef.current) {
+      // Fast path for paste: set hasContent without scanning textContent,
+      // skip detectTrigger / syncAttachedSkills, and defer the heavy
+      // innerHTML draft serialization. The flag is one-shot.
+      justPastedRef.current = false;
+      setHasContent(true);
+      scheduleDraftSave(ownerId, () => editorRef.current?.innerHTML ?? '');
+      return;
+    }
     updateHasContent();
     detectTrigger();
     syncAttachedSkills();
-    // Persist draft so it survives unmount/remount (card collapse, navigation)
-    const editor = editorRef.current;
-    if (editor) {
-      const html = editor.innerHTML;
-      if (html && html !== '<br>') {
-        _draftStore.set(ownerId, html);
-      } else {
-        _draftStore.delete(ownerId);
-      }
-    }
+    scheduleDraftSave(ownerId, () => editorRef.current?.innerHTML ?? '');
   }, [updateHasContent, detectTrigger, syncAttachedSkills, ownerId]);
 
   const handleEditorClick = useCallback(() => {
@@ -1092,7 +1113,10 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     }
     e.preventDefault();
     const plain = e.clipboardData.getData('text/plain');
-    if (plain) document.execCommand('insertText', false, plain);
+    if (plain) {
+      justPastedRef.current = true;
+      document.execCommand('insertText', false, plain);
+    }
   }, [addImageFiles, elementSelection, ownerId]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {

@@ -153,7 +153,19 @@ const RichPromptEditor: React.FC<RichPromptEditorProps> = ({
     }
   }, []);
 
+  // See ChatInput.handleInput: paste skips the heavy DOM scans that
+  // paste can't invalidate (never adds skill pills, never starts a
+  // slash/at trigger). emitChange still runs because Modes settings
+  // is controlled and the parent needs the new value.
+  const justPastedRef = useRef(false);
+
   const handleInput = useCallback(() => {
+    if (justPastedRef.current) {
+      justPastedRef.current = false;
+      setHasContent(true);
+      emitChange();
+      return;
+    }
     updateHasContent();
     detectTrigger();
     syncAttachedSkills();
@@ -236,7 +248,10 @@ const RichPromptEditor: React.FC<RichPromptEditorProps> = ({
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     e.preventDefault();
     const plain = e.clipboardData.getData('text/plain');
-    if (plain) document.execCommand('insertText', false, plain);
+    if (plain) {
+      justPastedRef.current = true;
+      document.execCommand('insertText', false, plain);
+    }
   }, []);
 
   return (

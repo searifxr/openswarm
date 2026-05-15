@@ -213,15 +213,15 @@ const clampPickerPlan = (plan: string | null | undefined): OpenSwarmPlan => {
 const AccountCard: React.FC = () => {
   const c = useClaudeTokens();
   const dispatch = useAppDispatch();
-  const settings = useAppSelector((s) => s.settings.data);
+  // Narrow selectors: each subscribes to one primitive so unrelated
+  // settings edits (e.g. theme toggle) don't re-render this card.
+  const userEmail = useAppSelector((s) => s.settings.data.user_email ?? null);
+  const userId = useAppSelector((s) => s.settings.data.user_id ?? null);
+  const signinMethod = useAppSelector((s) => s.settings.data.signin_method ?? null);
+  const hasBearer = useAppSelector((s) => Boolean(s.settings.data.openswarm_bearer_token));
+  const installId = useAppSelector((s) => s.settings.data.installation_id ?? '');
+  const proxyUrl = useAppSelector((s) => s.settings.data.openswarm_proxy_url || OPENSWARM_DEFAULT_PROXY_URL);
   const [signingOut, setSigningOut] = useState(false);
-
-  const userEmail = settings.user_email ?? null;
-  const userId = settings.user_id ?? null;
-  const signinMethod = settings.signin_method ?? null;
-  const hasBearer = Boolean(settings.openswarm_bearer_token);
-  const installId = settings.installation_id ?? '';
-  const proxyUrl = settings.openswarm_proxy_url || OPENSWARM_DEFAULT_PROXY_URL;
 
   const methodLabel = (() => {
     switch (signinMethod) {

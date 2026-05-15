@@ -614,7 +614,10 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
     }
     const used = Math.round(totalChars / 4);
     return { used, limit };
-  }, [activeBranchMessages, session?.system_prompt, session?.streamingMessage?.content, model, modelsByProvider]);
+    // Depending on streamingMessage.id (not .content) recomputes once per
+    // turn instead of per painted character. The header pct gauge would
+    // otherwise re-run a full-message length sum every animation frame.
+  }, [activeBranchMessages, session?.system_prompt, session?.streamingMessage?.id, model, modelsByProvider]);
 
   const sessionRunning = session?.status === 'running' || session?.status === 'waiting_approval';
 
