@@ -24,6 +24,7 @@ import {
 } from '../state/agentsSlice';
 import { streamStart, streamDelta, streamEnd } from '../state/streamingSlice';
 import { addBrowserCardFromBackend, removeBrowserCard, setBrowserCardPosition, setGlowingBrowserCards, GRID_GAP } from '../state/dashboardLayoutSlice';
+import { upsertOutput } from '../state/outputsSlice';
 import { getAuthToken } from '../config';
 import { notifyAgentCompletion } from '../notifications';
 
@@ -485,6 +486,16 @@ class WebSocketManager {
       case 'agent:message':
         if (session_id && data.message) {
           store.dispatch(addMessage({ sessionId: session_id, message: data.message }));
+        }
+        break;
+
+      case 'agent:output_upserted':
+        // Emitted by the backend when an Output row is created (canvas-launched
+        // App Builder seed) or updated (post-session meta.json sync). The
+        // upsert reducer merges over an existing row so a UI that already
+        // loaded the row doesn't lose locally-applied fields.
+        if (data.output && data.output.id) {
+          store.dispatch(upsertOutput(data.output));
         }
         break;
 
