@@ -663,6 +663,13 @@ class AgentManager:
             "through MCPActivate."
         )
         sections.append(
+            "1a. NEVER call any tool whose name begins with `mcp__claude_ai_` "
+            "(claude.ai-connected partner shims). They bypass the OpenSwarm "
+            "gate and don't share auth with this app. If the user wants Gmail/"
+            "Calendar/Drive, the equivalent OpenSwarm server is listed below; "
+            "activate that one via MCPActivate instead."
+        )
+        sections.append(
             "2. After MCPActivate returns, end the turn — a follow-up turn fires "
             "automatically with the new tools available."
         )
@@ -2374,6 +2381,17 @@ class AgentManager:
                 }
             if session.max_turns:
                 options_kwargs["max_turns"] = session.max_turns
+
+            # The claude_code preset auto-attaches the user's claude.ai-
+            # connected partner MCPs (`mcp__claude_ai_*`). Those bypass our
+            # MCPActivate gate, don't share OAuth state with the OpenSwarm
+            # Gmail/Calendar/Drive connectors the user actually configured
+            # here, and confuse the model into picking the partner shim
+            # instead of our vetted server. Hard-block them at the SDK
+            # layer so the model can't even attempt the call.
+            options_kwargs["disallowed_tools"] = [
+                "mcp__claude_ai_*",
+            ]
 
             if session.cwd:
                 # Pre-existing sessions may have workspaces that predate
