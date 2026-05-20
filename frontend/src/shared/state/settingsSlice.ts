@@ -54,6 +54,7 @@ export interface AppSettings {
   expand_new_chats_in_dashboard: boolean;
   auto_reveal_sub_agents: boolean;
   dev_mode: boolean;
+  allow_experimental_updates: boolean;
   // Optional managed-subscription state (surfaces only when user has
   // subscribed via the cloud). Mirrors AppSettings on the backend.
   connection_mode?: 'own_key' | 'openswarm-pro';
@@ -129,6 +130,7 @@ const initialState: SettingsState = {
     expand_new_chats_in_dashboard: false,
     auto_reveal_sub_agents: true,
     dev_mode: false,
+    allow_experimental_updates: false,
   },
   loading: false,
   loaded: false,
