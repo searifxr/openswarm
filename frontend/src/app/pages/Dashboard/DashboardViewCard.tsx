@@ -1,14 +1,17 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import IconButton from '@mui/material/IconButton';
 import Tooltip from '@mui/material/Tooltip';
 import RefreshIcon from '@mui/icons-material/Refresh';
+import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import CloseIcon from '@mui/icons-material/Close';
 import GridViewRoundedIcon from '@mui/icons-material/GridViewRounded';
 import { Output, SERVE_BASE } from '@/shared/state/outputsSlice';
 import { setViewCardPosition, setViewCardSize, removeViewCard } from '@/shared/state/dashboardLayoutSlice';
 import { useAppDispatch } from '@/shared/hooks';
+import { API_BASE, getAuthToken } from '@/shared/config';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import ViewPreview, { ViewPreviewHandle } from '@/app/pages/Views/ViewPreview';
 import { getDefault } from '@/app/pages/Views/InputSchemaForm';
@@ -232,6 +235,25 @@ const DashboardViewCard: React.FC<Props> = ({
     previewRef.current?.reload();
   };
 
+  const [reloadMenuRect, setReloadMenuRect] = useState<DOMRect | null>(null);
+  const handleHardReload = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setReloadMenuRect(null);
+    const wsId = output.workspace_id;
+    if (wsId) {
+      try {
+        const tok = getAuthToken();
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (tok) headers.Authorization = `Bearer ${tok}`;
+        await fetch(`${API_BASE}/outputs/workspace/${wsId}/runtime/restart`, {
+          method: 'POST',
+          headers,
+        });
+      } catch { /* failures surface via the runtime log WS */ }
+    }
+    previewRef.current?.reload();
+  }, [output.workspace_id]);
+
   const mdDx = (!isDragging && isSelected && multiDragDelta) ? multiDragDelta.dx : 0;
   const mdDy = (!isDragging && isSelected && multiDragDelta) ? multiDragDelta.dy : 0;
   const displayX = localResize?.x ?? localDragPos?.x ?? (cardX + mdDx);
@@ -345,10 +367,16 @@ const DashboardViewCard: React.FC<Props> = ({
           {output.name}
         </Typography>
 
-        <Tooltip title="Reload preview" placement="top">
+        <Tooltip title="Reload preview; right-click for Hard Reload" placement="top">
           <IconButton
             size="small"
             onClick={handleRefresh}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              if (!output.workspace_id) return;
+              setReloadMenuRect((e.currentTarget as HTMLElement).getBoundingClientRect());
+            }}
             onPointerDown={(e) => e.stopPropagation()}
             sx={{ color: c.text.muted, p: 0.5, '&:hover': { color: c.text.primary } }}
           >
@@ -398,6 +426,55 @@ const DashboardViewCard: React.FC<Props> = ({
           }}
         />
       ))}
+
+      {/* Custom popover: MUI Menu's Popover machinery fought the canvas transform + Electron webview compositor, so this is plain position:fixed JSX. Floats above the icon into empty canvas, never overlaps the webview. */}
+      {reloadMenuRect && createPortal(
+        <>
+          <Box
+            onClick={() => setReloadMenuRect(null)}
+            onContextMenu={(e) => { e.preventDefault(); setReloadMenuRect(null); }}
+            sx={{ position: 'fixed', inset: 0, zIndex: 2147483646 }}
+          />
+          <Box
+            sx={{
+              position: 'fixed',
+              bottom: window.innerHeight - reloadMenuRect.top + 6,
+              right: window.innerWidth - reloadMenuRect.right,
+              zIndex: 2147483647,
+              bgcolor: c.bg.elevated,
+              border: `1px solid ${c.border.subtle}`,
+              borderRadius: `${c.radius.md}px`,
+              boxShadow: c.shadow.lg,
+              minWidth: 260,
+              py: 0.5,
+            }}
+          >
+            <Box
+              onClick={handleHardReload}
+              sx={{
+                px: 1.5, py: 1,
+                display: 'flex',
+                gap: 1.25,
+                alignItems: 'center',
+                cursor: 'pointer',
+                transition: 'background-color 0.12s',
+                '&:hover': { bgcolor: c.bg.surface },
+              }}
+            >
+              <RestartAltIcon sx={{ fontSize: 18, color: c.text.muted, flexShrink: 0 }} />
+              <Box>
+                <Typography sx={{ fontSize: '0.82rem', fontWeight: 500, color: c.text.primary, lineHeight: 1.2 }}>
+                  Reset & Hard Reload
+                </Typography>
+                <Typography sx={{ fontSize: '0.7rem', color: c.text.ghost, mt: 0.25 }}>
+                  Restart backend.py + reload preview
+                </Typography>
+              </Box>
+            </Box>
+          </Box>
+        </>,
+        document.body,
+      )}
     </Box>
   );
 };
