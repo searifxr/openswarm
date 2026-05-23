@@ -29,7 +29,7 @@ const Analytics = lazy(() => import('./pages/Analytics/Analytics'));
 const OnboardingRoot = lazy(() =>
   import('./components/Onboarding').then((m) => ({ default: m.OnboardingRoot })),
 );
-const SignInGate = lazy(() => import('./components/SignInGate'));
+const SignInGate = lazy(() => import('./components/overlays/SignInGate'));
 
 if (typeof window !== 'undefined') {
   (window as any).__openswarmPrefetchRoute = (path: string) => {
@@ -64,7 +64,7 @@ import { useKeyboardShortcuts } from '@/shared/hooks/useKeyboardShortcuts';
 import { useDeepLink } from '@/shared/hooks/useDeepLink';
 import { useWindowFocus } from '@/shared/hooks/useWindowFocus';
 import { useInteractionHeartbeat } from '@/shared/hooks/useInteractionHeartbeat';
-import KeyboardShortcutsHelp from './components/KeyboardShortcutsHelp';
+import KeyboardShortcutsHelp from './components/overlays/KeyboardShortcutsHelp';
 import { ThemeProvider, useThemeMode, useClaudeTokens } from '@/shared/styles/ThemeContext';
 import { ClaudeTokens } from '@/shared/styles/claudeTokens';
 

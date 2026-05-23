@@ -23,7 +23,7 @@ import { openSettingsModal } from '@/shared/state/settingsSlice';
 import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import { SKILL_COLOR } from '@/app/components/editor/richEditorUtils';
-import PlanPicker from '@/app/components/PlanPicker';
+import PlanPicker from '@/app/components/overlays/PlanPicker';
 import { ErrorSlime } from '@/app/components/feedback/ErrorSlime';
 
 const streamingCursorKeyframes = `

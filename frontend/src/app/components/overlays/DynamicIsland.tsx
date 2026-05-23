@@ -31,7 +31,7 @@ import { API_BASE, getAuthToken } from '@/shared/config';
 import { store } from '@/shared/state/store';
 import { setPendingFocusAgentId } from '@/shared/state/tempStateSlice';
 import ApprovalBar, { BatchApprovalBar, parseMcpToolName, useMcpToolMeta, getToolIcon } from '@/app/pages/AgentChat/shell/ApprovalBar';
-import GlobalSearchPalette from '@/app/components/GlobalSearchPalette';
+import GlobalSearchPalette from '@/app/components/overlays/GlobalSearchPalette';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 
 type IslandState = 'idle' | 'compact' | 'compact-actionable' | 'expanded';

@@ -9,7 +9,7 @@ import { closeSettingsModal, AppSettings } from '@/shared/state/settingsSlice';
 import { onboardingBus } from '@/app/components/Onboarding/eventBus';
 import { resetTour } from '@/shared/state/onboardingProgressSlice';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
-import TrustedFilePatterns from '@/app/components/TrustedFilePatterns';
+import TrustedFilePatterns from '@/app/components/overlays/TrustedFilePatterns';
 import SoftwareUpdateRow from './SoftwareUpdateRow';
 import type { SettingsStyles } from '../settingsStyles';
 

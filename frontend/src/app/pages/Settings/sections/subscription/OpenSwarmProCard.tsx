@@ -8,7 +8,7 @@ import { useAppDispatch } from '@/shared/hooks';
 import { disconnectSubscription } from '@/shared/state/settingsSlice';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import { API_BASE } from '@/shared/config';
-import PlanPicker from '@/app/components/PlanPicker';
+import PlanPicker from '@/app/components/overlays/PlanPicker';
 import type { OpenSwarmPlan } from '@/shared/subscription/checkout';
 
 /** Pro managed-subscription card: Subscribe CTA when disconnected, live usage + Manage/Disconnect when active. */
