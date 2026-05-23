@@ -101,7 +101,6 @@
       "frontend/src/app/pages/AgentChat/AgentChat.tsx",
       "frontend/src/app/pages/AgentChat/ApprovalBar.tsx",
       "frontend/src/app/pages/AgentChat/BrowserAgentInlineFeed.tsx",
-      "frontend/src/app/pages/AgentChat/ChatInput.tsx",
       "frontend/src/app/pages/AgentChat/MessageBubble.tsx",
       "frontend/src/app/pages/AgentChat/toolLabels.ts",
       "frontend/src/app/pages/Analytics/PixelChart.tsx",
