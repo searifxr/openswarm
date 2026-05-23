@@ -35,6 +35,13 @@ from backend.apps.agents.error_classify import (
     _is_long_context_error,
     _is_transient_capacity_error,
 )
+from backend.apps.agents.session_store import (
+    _delete_session_file,
+    _load_all_session_data,
+    _load_session_data,
+    _save_session,
+    build_search_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,36 +94,6 @@ def _apply_context_window(session, settings=None) -> None:
     except Exception:
         logger.debug("context_window lookup failed; keeping existing value", exc_info=True)
 
-
-def _save_session(session_id: str, doc_data: dict):
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    with open(os.path.join(SESSIONS_DIR, f"{session_id}.json"), "w") as f:
-        json.dump(doc_data, f, indent=2)
-
-
-def _load_session_data(session_id: str) -> dict | None:
-    path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-
-def _delete_session_file(session_id: str):
-    path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
-    if os.path.exists(path):
-        os.remove(path)
-
-
-def _load_all_session_data() -> list[tuple[str, dict]]:
-    results = []
-    if not os.path.exists(SESSIONS_DIR):
-        return results
-    for fname in os.listdir(SESSIONS_DIR):
-        if fname.endswith(".json"):
-            with open(os.path.join(SESSIONS_DIR, fname)) as f:
-                results.append((fname[:-5], json.load(f)))
-    return results
 
 FULL_TOOLS = [
     "Read", "Edit", "Write", "Bash", "Glob", "Grep", "AskUserQuestion",
@@ -4625,13 +4602,7 @@ class AgentManager:
 
     @staticmethod
     def _build_search_text(session: AgentSession, max_len: int = 5000) -> str:
-        """Build a search-indexing string from the session name and message content."""
-        parts = [session.name or ""]
-        for msg in session.messages:
-            if msg.role in ("user", "assistant") and isinstance(msg.content, str):
-                parts.append(msg.content)
-        text = " ".join(parts)
-        return text[:max_len]
+        return build_search_text(session, max_len)
 
     def _sync_session_close(self, session: AgentSession, close_reason: str = "user"):
         """Submit the session state to the cloud on close. The cloud
