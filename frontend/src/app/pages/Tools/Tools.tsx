@@ -89,6 +89,9 @@ import { API_BASE } from '@/shared/config';
 import { Integration, INTEGRATIONS } from './integrations';
 import { CATEGORY_ORDER, ToolForm, emptyForm, cleanServerName, serverToToolForm, serverToMcpConfig } from './toolsHelpers';
 import ToolSection from './ToolSection';
+import BrowserPermissionCard from './BrowserPermissionCard';
+import RegistryBrowserDialog from './RegistryBrowserDialog';
+import ToolDialogs from './ToolDialogs';
 
 const Tools: React.FC = () => {
   const c = useClaudeTokens();
@@ -717,150 +720,20 @@ const Tools: React.FC = () => {
       )}
 
       {browserTools.length > 0 && (
-        <Card sx={{ bgcolor: c.bg.surface, border: `1px solid ${browserSectionOpen && browserSectionEnabled ? c.accent.primary : c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, '&:hover': { borderColor: c.accent.primary, boxShadow: '0 0 0 1px rgba(174,86,48,0.12)' }, transition: 'border-color 0.2s, box-shadow 0.2s' }}>
-          <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
-            <Box
-              onClick={() => browserSectionEnabled && setBrowserSectionOpen((v) => !v)}
-              sx={{ display: 'flex', alignItems: 'center', gap: 2, cursor: browserSectionEnabled ? 'pointer' : 'default' }}
-            >
-              <Box sx={{
-                width: 36, height: 36, borderRadius: 2, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                bgcolor: c.bg.secondary, color: c.text.tertiary, flexShrink: 0,
-                opacity: browserSectionEnabled ? 1 : 0.4, transition: 'opacity 0.2s',
-              }}>
-                <PublicIcon sx={{ fontSize: 18 }} />
-              </Box>
-              <Box sx={{ flex: 1, minWidth: 0, opacity: browserSectionEnabled ? 1 : 0.4, transition: 'opacity 0.2s' }}>
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.25 }}>
-                  <Typography sx={{ color: c.text.primary, fontWeight: 600, fontSize: '0.95rem' }}>Browser</Typography>
-                  <Chip label={`${browserTools.length} actions`} size="small" sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.7rem', height: 20, '& .MuiChip-label': { px: 0.6 } }} />
-                </Box>
-                <Typography sx={{ color: c.text.muted, fontSize: '0.84rem' }}>Browser automation delegation and individual browser actions</Typography>
-              </Box>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }} onClick={(e) => e.stopPropagation()}>
-                <Switch
-                  checked={browserSectionEnabled}
-                  onChange={(_, checked) => handleSectionEnabledChange(browserTools, checked)}
-                  sx={{
-                    '& .MuiSwitch-switchBase.Mui-checked': { color: c.accent.primary },
-                    '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { bgcolor: c.accent.primary },
-                  }}
-                />
-              </Box>
-              {browserSectionEnabled && (
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, flexShrink: 0 }}>
-                  <KeyboardArrowDownIcon sx={{ fontSize: 18, color: c.text.ghost, transition: 'transform 0.2s', transform: browserSectionOpen ? 'rotate(180deg)' : 'rotate(0deg)' }} />
-                </Box>
-              )}
-            </Box>
-          </CardContent>
-          <Collapse in={browserSectionOpen && browserSectionEnabled} timeout={0} unmountOnExit>
-            <Box sx={{ px: 2, pb: 2, pt: 0, borderTop: `1px solid ${c.border.subtle}` }}>
-              <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mt: 1.5, mb: 1 }}>
-                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                  <SecurityIcon sx={{ fontSize: 14, color: c.text.muted }} />
-                  <Typography sx={{ color: c.text.muted, fontSize: '0.78rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em' }}>Action Permissions</Typography>
-                  <Chip label={`${browserTools.length} actions`} size="small" sx={{ bgcolor: c.bg.secondary, color: c.text.ghost, fontSize: '0.65rem', height: 18, ml: 0.5, '& .MuiChip-label': { px: 0.6 } }} />
-                </Box>
-              </Box>
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75 }}>
-                {browserDelegationTools.length > 0 && (() => {
-                  const delegationPolicies = browserDelegationTools.map((t) => builtinPermissions[t.name] || 'always_allow');
-                  const groupPolicy = delegationPolicies.every((p) => p === 'always_allow') ? 'always_allow'
-                    : delegationPolicies.every((p) => p === 'deny') ? 'deny'
-                    : delegationPolicies.every((p) => p === 'ask') ? 'ask' : 'ask';
-                  const isOpen = !browserCollapsed.browser_delegation;
-                  return (
-                    <Box sx={{ border: `1px solid ${c.border.subtle}`, borderRadius: 1.5, overflow: 'hidden', '&:hover': { borderColor: c.border.medium } }}>
-                      <Box
-                        sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 0.75, cursor: 'pointer', bgcolor: isOpen ? c.bg.secondary : 'transparent', '&:hover': { bgcolor: c.bg.secondary } }}
-                        onClick={() => setBrowserCollapsed((p) => ({ ...p, browser_delegation: !p.browser_delegation }))}
-                      >
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <KeyboardArrowDownIcon sx={{ fontSize: 16, color: c.text.ghost, transition: 'transform 0.15s', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }} />
-                          <Typography sx={{ color: c.text.primary, fontSize: '0.85rem', fontWeight: 600 }}>Delegation</Typography>
-                          <Chip label={browserDelegationTools.length} size="small" sx={{ bgcolor: c.bg.page, color: c.text.muted, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
-                        </Box>
-                        <Box sx={{ display: 'flex', gap: 0.25 }} onClick={(e) => e.stopPropagation()}>
-                          <Tooltip title="Always allow"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserDelegationTools.map((t) => t.name), 'always_allow')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'always_allow' ? `${c.status.success}20` : 'transparent', color: groupPolicy === 'always_allow' ? c.status.success : c.text.ghost, '&:hover': { bgcolor: `${c.status.success}15`, color: c.status.success } }}><CheckCircleIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                          <Tooltip title="Ask permission"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserDelegationTools.map((t) => t.name), 'ask')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'ask' ? `${c.status.warning}20` : 'transparent', color: groupPolicy === 'ask' ? c.status.warning : c.text.ghost, '&:hover': { bgcolor: `${c.status.warning}15`, color: c.status.warning } }}><PanToolIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                          <Tooltip title="Always deny"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserDelegationTools.map((t) => t.name), 'deny')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'deny' ? `${c.status.error}20` : 'transparent', color: groupPolicy === 'deny' ? c.status.error : c.text.ghost, '&:hover': { bgcolor: `${c.status.error}15`, color: c.status.error } }}><BlockIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                        </Box>
-                      </Box>
-                      <Collapse in={isOpen} timeout={0} unmountOnExit>
-                        <Box sx={{ px: 1, pb: 1 }}>
-                          {browserDelegationTools.map((bt) => {
-                            const toolPolicy = builtinPermissions[bt.name] || 'always_allow';
-                            return (
-                              <Box key={bt.name} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 0.4, px: 1.5, borderRadius: 1, '&:hover': { bgcolor: c.bg.secondary } }}>
-                                <Box sx={{ minWidth: 0, flex: 1, mr: 1 }}>
-                                  <Typography sx={{ color: c.text.primary, fontSize: '0.8rem', fontWeight: 500 }}>{bt.display_name || bt.name}</Typography>
-                                  {bt.description && <Typography sx={{ color: c.text.ghost, fontSize: '0.7rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bt.description}</Typography>}
-                                </Box>
-                                <Box sx={{ display: 'flex', gap: 0.25 }} onClick={(e) => e.stopPropagation()}>
-                                  <Tooltip title="Always allow"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'always_allow')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'always_allow' ? `${c.status.success}20` : 'transparent', color: toolPolicy === 'always_allow' ? c.status.success : c.text.ghost, '&:hover': { bgcolor: `${c.status.success}15`, color: c.status.success } }}><CheckCircleIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                  <Tooltip title="Ask permission"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'ask')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'ask' ? `${c.status.warning}20` : 'transparent', color: toolPolicy === 'ask' ? c.status.warning : c.text.ghost, '&:hover': { bgcolor: `${c.status.warning}15`, color: c.status.warning } }}><PanToolIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                  <Tooltip title="Always deny"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'deny')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'deny' ? `${c.status.error}20` : 'transparent', color: toolPolicy === 'deny' ? c.status.error : c.text.ghost, '&:hover': { bgcolor: `${c.status.error}15`, color: c.status.error } }}><BlockIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                </Box>
-                              </Box>
-                            );
-                          })}
-                        </Box>
-                      </Collapse>
-                    </Box>
-                  );
-                })()}
-
-                {browserActionTools.length > 0 && (() => {
-                  const actionPolicies = browserActionTools.map((t) => builtinPermissions[t.name] || 'always_allow');
-                  const groupPolicy = actionPolicies.every((p) => p === 'always_allow') ? 'always_allow'
-                    : actionPolicies.every((p) => p === 'deny') ? 'deny'
-                    : actionPolicies.every((p) => p === 'ask') ? 'ask' : 'ask';
-                  const isOpen = !browserCollapsed.browser_action;
-                  return (
-                    <Box sx={{ border: `1px solid ${c.border.subtle}`, borderRadius: 1.5, overflow: 'hidden', '&:hover': { borderColor: c.border.medium } }}>
-                      <Box
-                        sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', px: 1.5, py: 0.75, cursor: 'pointer', bgcolor: isOpen ? c.bg.secondary : 'transparent', '&:hover': { bgcolor: c.bg.secondary } }}
-                        onClick={() => setBrowserCollapsed((p) => ({ ...p, browser_action: !p.browser_action }))}
-                      >
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <KeyboardArrowDownIcon sx={{ fontSize: 16, color: c.text.ghost, transition: 'transform 0.15s', transform: isOpen ? 'rotate(0deg)' : 'rotate(-90deg)' }} />
-                          <Typography sx={{ color: c.text.primary, fontSize: '0.85rem', fontWeight: 600 }}>Browser Actions</Typography>
-                          <Chip label={browserActionTools.length} size="small" sx={{ bgcolor: c.bg.page, color: c.text.muted, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
-                        </Box>
-                        <Box sx={{ display: 'flex', gap: 0.25 }} onClick={(e) => e.stopPropagation()}>
-                          <Tooltip title="Always allow"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserActionTools.map((t) => t.name), 'always_allow')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'always_allow' ? `${c.status.success}20` : 'transparent', color: groupPolicy === 'always_allow' ? c.status.success : c.text.ghost, '&:hover': { bgcolor: `${c.status.success}15`, color: c.status.success } }}><CheckCircleIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                          <Tooltip title="Ask permission"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserActionTools.map((t) => t.name), 'ask')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'ask' ? `${c.status.warning}20` : 'transparent', color: groupPolicy === 'ask' ? c.status.warning : c.text.ghost, '&:hover': { bgcolor: `${c.status.warning}15`, color: c.status.warning } }}><PanToolIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                          <Tooltip title="Always deny"><IconButton size="small" onClick={() => handleBuiltinCategoryPermissionChange(browserActionTools.map((t) => t.name), 'deny')} sx={{ p: 0.4, borderRadius: 1, bgcolor: groupPolicy === 'deny' ? `${c.status.error}20` : 'transparent', color: groupPolicy === 'deny' ? c.status.error : c.text.ghost, '&:hover': { bgcolor: `${c.status.error}15`, color: c.status.error } }}><BlockIcon sx={{ fontSize: 16 }} /></IconButton></Tooltip>
-                        </Box>
-                      </Box>
-                      <Collapse in={isOpen} timeout={0} unmountOnExit>
-                        <Box sx={{ px: 1, pb: 1 }}>
-                          {browserActionTools.map((bt) => {
-                            const toolPolicy = builtinPermissions[bt.name] || 'always_allow';
-                            return (
-                              <Box key={bt.name} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 0.4, px: 1.5, borderRadius: 1, '&:hover': { bgcolor: c.bg.secondary } }}>
-                                <Box sx={{ minWidth: 0, flex: 1, mr: 1 }}>
-                                  <Typography sx={{ color: c.text.primary, fontSize: '0.8rem', fontWeight: 500 }}>{bt.display_name || bt.name}</Typography>
-                                  {bt.description && <Typography sx={{ color: c.text.ghost, fontSize: '0.7rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{bt.description}</Typography>}
-                                </Box>
-                                <Box sx={{ display: 'flex', gap: 0.25 }} onClick={(e) => e.stopPropagation()}>
-                                  <Tooltip title="Always allow"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'always_allow')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'always_allow' ? `${c.status.success}20` : 'transparent', color: toolPolicy === 'always_allow' ? c.status.success : c.text.ghost, '&:hover': { bgcolor: `${c.status.success}15`, color: c.status.success } }}><CheckCircleIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                  <Tooltip title="Ask permission"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'ask')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'ask' ? `${c.status.warning}20` : 'transparent', color: toolPolicy === 'ask' ? c.status.warning : c.text.ghost, '&:hover': { bgcolor: `${c.status.warning}15`, color: c.status.warning } }}><PanToolIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                  <Tooltip title="Always deny"><IconButton size="small" onClick={() => handleBuiltinPermissionChange(bt.name, 'deny')} sx={{ p: 0.4, borderRadius: 1, bgcolor: toolPolicy === 'deny' ? `${c.status.error}20` : 'transparent', color: toolPolicy === 'deny' ? c.status.error : c.text.ghost, '&:hover': { bgcolor: `${c.status.error}15`, color: c.status.error } }}><BlockIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
-                                </Box>
-                              </Box>
-                            );
-                          })}
-                        </Box>
-                      </Collapse>
-                    </Box>
-                  );
-                })()}
-              </Box>
-            </Box>
-          </Collapse>
-        </Card>
+        <BrowserPermissionCard
+          open={browserSectionOpen}
+          enabled={browserSectionEnabled}
+          onToggleOpen={() => setBrowserSectionOpen((v) => !v)}
+          browserTools={browserTools}
+          browserDelegationTools={browserDelegationTools}
+          browserActionTools={browserActionTools}
+          browserCollapsed={browserCollapsed}
+          setBrowserCollapsed={setBrowserCollapsed}
+          builtinPermissions={builtinPermissions}
+          onSectionEnabledChange={handleSectionEnabledChange}
+          onCategoryPermissionChange={handleBuiltinCategoryPermissionChange}
+          onPermissionChange={handleBuiltinPermissionChange}
+        />
       )}
 
           </Box>
@@ -1359,547 +1232,69 @@ const Tools: React.FC = () => {
         </Collapse>
       </Box>
 
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth PaperProps={{ sx: { bgcolor: c.bg.surface, backgroundImage: 'none', borderRadius: 4, border: `1px solid ${c.border.subtle}` } }}>
-        <DialogTitle sx={{ color: c.text.primary, fontWeight: 600 }}>{editingId ? 'Edit Tool' : 'New Tool'}</DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
-          <TextField label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} fullWidth size="small" sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.page } }} />
-          <TextField label="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} fullWidth size="small" sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.page } }} />
-          <TextField label="Command (slash command name)" value={form.command} onChange={(e) => setForm({ ...form, command: e.target.value })} fullWidth size="small" placeholder="e.g. my-tool" sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.page } }} />
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setDialogOpen(false)} sx={{ color: c.text.tertiary, textTransform: 'none' }}>Cancel</Button>
-          <Button variant="contained" onClick={handleSave} disabled={!form.name} sx={{ bgcolor: c.accent.primary, '&:hover': { bgcolor: c.accent.pressed }, textTransform: 'none', borderRadius: 2 }}>{editingId ? 'Save Changes' : 'Create Tool'}</Button>
-        </DialogActions>
-      </Dialog>
+      <ToolDialogs
+        dialogOpen={dialogOpen}
+        setDialogOpen={setDialogOpen}
+        editingId={editingId}
+        form={form}
+        setForm={setForm}
+        onSave={handleSave}
+        mcpConfigOpen={mcpConfigOpen}
+        setMcpConfigOpen={setMcpConfigOpen}
+        mcpConfigServer={mcpConfigServer}
+        mcpConfigJson={mcpConfigJson}
+        setMcpConfigJson={setMcpConfigJson}
+        mcpConfigError={mcpConfigError}
+        setMcpConfigError={setMcpConfigError}
+        mcpAuthType={mcpAuthType}
+        setMcpAuthType={setMcpAuthType}
+        mcpCredentials={mcpCredentials}
+        setMcpCredentials={setMcpCredentials}
+        onMcpConfigSave={handleMcpConfigSave}
+        deviceCodeDialogOpen={deviceCodeDialogOpen}
+        setDeviceCodeDialogOpen={setDeviceCodeDialogOpen}
+        deviceCodeStatus={deviceCodeStatus}
+        deviceCodeUrl={deviceCodeUrl}
+        deviceCode={deviceCode}
+        credDialogOpen={credDialogOpen}
+        setCredDialogOpen={setCredDialogOpen}
+        credDialogIntegration={credDialogIntegration}
+        credDialogValues={credDialogValues}
+        setCredDialogValues={setCredDialogValues}
+        credDialogSaving={credDialogSaving}
+        onSlackAutoConnect={handleSlackAutoConnect}
+        onCredentialsSave={handleCredentialsSave}
+      />
 
-      <Dialog
+      <RegistryBrowserDialog
         open={registryOpen}
         onClose={() => setRegistryOpen(false)}
-        maxWidth="md"
-        fullWidth
-        PaperProps={{ sx: { bgcolor: c.bg.page, backgroundImage: 'none', borderRadius: 4, border: `1px solid ${c.border.subtle}`, height: '80vh' } }}
-      >
-        <DialogTitle sx={{ color: c.text.primary, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 1.5, pb: 1 }}>
-          <StorefrontIcon sx={{ color: c.accent.primary }} />
-          MCP Registry
-          {regStats && (
-            <>
-              <Chip
-                label={
-                  regSource === 'google'
-                    ? `${regStats.google.toLocaleString()} Google servers`
-                    : regSource === 'community'
-                      ? `${regStats.community.toLocaleString()} Community servers`
-                      : `${regStats.total.toLocaleString()} servers`
-                }
-                size="small"
-                sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.7rem', height: 20, ml: 'auto' }}
-              />
-              {devMode && regStats.lastUpdated > 0 && (
-                <Typography sx={{ color: c.text.ghost, fontSize: '0.68rem', flexShrink: 0 }}>
-                  Synced {Math.round((Date.now() / 1000 - regStats.lastUpdated) / 60)}m ago
-                </Typography>
-              )}
-            </>
-          )}
-        </DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 0, px: 3, pb: 0, overflow: 'hidden',
-          '&::-webkit-scrollbar': { width: 6 },
-          '&::-webkit-scrollbar-track': { background: 'transparent' },
-          '&::-webkit-scrollbar-thumb': { background: c.border.medium, borderRadius: 3, '&:hover': { background: c.border.strong } },
-          scrollbarWidth: 'thin', scrollbarColor: `${c.border.medium} transparent`,
-        }}>
-          <Box sx={{ display: 'flex', gap: 1, mb: 1.5, alignItems: 'center' }}>
-            <TextField
-              placeholder="Search MCP servers..."
-              value={regQuery}
-              onChange={(e) => handleRegSearch(e.target.value)}
-              fullWidth
-              size="small"
-              autoFocus
-              InputProps={{
-                startAdornment: (
-                  <InputAdornment position="start">
-                    <SearchIcon sx={{ color: c.text.ghost, fontSize: 20 }} />
-                  </InputAdornment>
-                ),
-              }}
-              sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.surface, borderRadius: 2 } }}
-            />
-            <ToggleButtonGroup
-              value={regSource}
-              exclusive
-              onChange={handleRegSourceFilter}
-              size="small"
-              sx={{
-                flexShrink: 0,
-                '& .MuiToggleButton-root': {
-                  color: c.text.ghost, border: `1px solid ${c.border.medium}`, textTransform: 'none',
-                  fontSize: '0.72rem', py: 0.5, px: 1.2, lineHeight: 1.4,
-                  '&.Mui-selected': { bgcolor: c.bg.secondary, color: c.text.primary, borderColor: c.border.strong },
-                  '&:hover': { bgcolor: c.bg.secondary },
-                },
-              }}
-            >
-              <ToggleButton value="curated">Curated</ToggleButton>
-              <ToggleButton value="">All</ToggleButton>
-              <ToggleButton value="community"><PublicIcon sx={{ fontSize: 14, mr: 0.5 }} />Community</ToggleButton>
-              <ToggleButton value="google"><CloudIcon sx={{ fontSize: 14, mr: 0.5 }} />Google</ToggleButton>
-            </ToggleButtonGroup>
-            <Tooltip title={regSort === 'name' ? 'Sort by stars' : 'Sort by name'}>
-              <IconButton
-                size="small"
-                onClick={() => handleRegSort(regSort === 'name' ? 'stars' : 'name')}
-                sx={{
-                  color: regSort === 'stars' ? '#c89c00' : c.text.ghost,
-                  border: '1px solid',
-                  borderColor: regSort === 'stars' ? '#c89c0040' : c.border.medium,
-                  borderRadius: 1.5,
-                  px: 1,
-                  flexShrink: 0,
-                  transition: 'all 0.15s',
-                  '&:hover': { borderColor: '#c89c00', color: '#c89c00' },
-                }}
-              >
-                <StarIcon sx={{ fontSize: 16 }} />
-                <SortIcon sx={{ fontSize: 14, ml: 0.25 }} />
-              </IconButton>
-            </Tooltip>
-          </Box>
-
-          {regLoading && regServers.length === 0 ? (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.25, flex: 1, py: 1 }}>
-              {[0, 1, 2, 3, 4, 5].map((i) => (
-                <Skeleton key={i} variant="card" height={56} />
-              ))}
-            </Box>
-          ) : regServers.length === 0 ? (
-            <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, color: c.text.ghost, gap: 1.5 }}>
-              <SearchIcon sx={{ fontSize: 40, opacity: 0.3 }} />
-              <Typography sx={{ fontSize: '0.9rem' }}>No servers found matching "{regQuery}"</Typography>
-            </Box>
-          ) : (
-            <Box sx={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column', gap: 0.5,
-              '&::-webkit-scrollbar': { width: 6 },
-              '&::-webkit-scrollbar-track': { background: 'transparent' },
-              '&::-webkit-scrollbar-thumb': { background: c.border.medium, borderRadius: 3, '&:hover': { background: c.border.strong } },
-              scrollbarWidth: 'thin', scrollbarColor: `${c.border.medium} transparent`,
-            }}>
-              <Typography sx={{ color: c.text.ghost, fontSize: '0.75rem', mb: 0.5 }}>
-                Showing {regServers.length} of {regTotal.toLocaleString()} results
-              </Typography>
-              {regServers.map((srv) => {
-                const isExpanded = expandedServer === srv.name;
-                const isInstalled = allTools.some((t) => t.name === (srv.title || cleanServerName(srv.name)));
-                return (
-                  <Box key={srv.name}>
-                    <Box
-                      onClick={() => {
-                        const next = isExpanded ? null : srv.name;
-                        setExpandedServer(next);
-                        if (next && devMode) {
-                          dispatch(clearDetail());
-                          dispatch(fetchServerDetail(srv.name));
-                        }
-                      }}
-                      sx={{
-                        display: 'flex', alignItems: 'center', gap: 1.5,
-                        px: 1.5, py: 1, borderRadius: 1.5, cursor: 'pointer',
-                        transition: 'background 0.15s',
-                        '&:hover': { bgcolor: c.bg.secondary },
-                        ...(isExpanded && { bgcolor: c.bg.secondary }),
-                      }}
-                    >
-                      <Avatar
-                        src={srv.iconUrl || undefined}
-                        sx={{
-                          width: 24, height: 24, flexShrink: 0, bgcolor: c.bg.secondary,
-                          fontSize: '0.7rem', fontWeight: 700, color: c.text.muted,
-                        }}
-                      >
-                        {srv.iconUrl ? null : (srv.title || cleanServerName(srv.name)).charAt(0).toUpperCase()}
-                      </Avatar>
-                      <Box sx={{ flex: 1, minWidth: 0 }}>
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <Typography sx={{ color: c.text.primary, fontWeight: 600, fontSize: '0.88rem', fontFamily: c.font.mono }}>
-                            {srv.title || cleanServerName(srv.name)}
-                          </Typography>
-                          {srv.version && <Chip label={`v${srv.version}`} size="small" sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />}
-                          {srv.remoteType && <Chip label={srv.remoteType} size="small" sx={{ bgcolor: '#3b82f615', color: '#3b82f6', fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />}
-                          {srv.source === 'google' ? (
-                            <Chip icon={<CloudIcon sx={{ fontSize: 12 }} />} label="Google" size="small" sx={{ bgcolor: `${c.status.info}15`, color: c.status.info, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.4 }, '& .MuiChip-icon': { ml: 0.4, color: c.status.info } }} />
-                          ) : (
-                            <Chip icon={<PublicIcon sx={{ fontSize: 12 }} />} label="Community" size="small" sx={{ bgcolor: 'rgba(174,86,48,0.08)', color: c.accent.primary, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.4 }, '& .MuiChip-icon': { ml: 0.4, color: c.accent.primary } }} />
-                          )}
-                          {srv.stars != null && (
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.25, ml: 0.5 }}>
-                              <StarIcon sx={{ fontSize: 13, color: '#c89c00' }} />
-                              <Typography sx={{ color: c.text.muted, fontSize: '0.7rem', fontWeight: 600, lineHeight: 1 }}>
-                                {srv.stars >= 1000 ? `${(srv.stars / 1000).toFixed(1)}k` : srv.stars.toLocaleString()}
-                              </Typography>
-                            </Box>
-                          )}
-                          {devMode && !srv.remoteType && (
-                            <Chip label="stdio" size="small" sx={{ bgcolor: '#8b5cf615', color: '#8b5cf6', fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
-                          )}
-                          {isInstalled && (
-                            <Chip icon={<CheckCircleIcon sx={{ fontSize: 12 }} />} label="Installed" size="small" sx={{ bgcolor: `${c.status.success}15`, color: c.status.success, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.4 }, '& .MuiChip-icon': { ml: 0.4, color: c.status.success } }} />
-                          )}
-                        </Box>
-                        <Typography sx={{ color: c.text.tertiary, fontSize: '0.78rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                          {srv.description}
-                        </Typography>
-                      </Box>
-                      <KeyboardArrowDownIcon sx={{ fontSize: 16, color: c.text.ghost, transition: 'transform 0.2s', transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)', flexShrink: 0 }} />
-                    </Box>
-
-                    <Collapse in={isExpanded} timeout={0} unmountOnExit>
-                      <Box sx={{ ml: 4.5, mr: 1.5, mb: 1, px: 2, py: 1.5, bgcolor: c.bg.elevated, borderRadius: 1.5, borderLeft: '2px solid rgba(174,86,48,0.12)' }}>
-                        <Typography sx={{ color: c.text.secondary, fontSize: '0.85rem', mb: 1.5, lineHeight: 1.5 }}>
-                          {srv.description}
-                        </Typography>
-
-                        <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1, mb: 2 }}>
-                          <Typography sx={{ color: c.text.ghost, fontSize: '0.72rem', fontFamily: c.font.mono }}>
-                            {srv.name}
-                          </Typography>
-                          {srv.remoteUrl && (
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                              <Typography sx={{ color: c.text.ghost, fontSize: '0.72rem', textTransform: 'uppercase' }}>Endpoint</Typography>
-                              <Typography sx={{ color: c.text.muted, fontSize: '0.78rem', fontFamily: c.font.mono }}>{srv.remoteUrl}</Typography>
-                            </Box>
-                          )}
-                          <Box sx={{ display: 'flex', gap: 1 }}>
-                            {srv.websiteUrl && (
-                              <Chip
-                                component="a"
-                                href={srv.websiteUrl}
-                                clickable
-                                icon={<OpenInNewIcon sx={{ fontSize: 12 }} />}
-                                label="Website"
-                                size="small"
-                                sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.7rem', height: 22 }}
-                              />
-                            )}
-                            {srv.repositoryUrl && (
-                              <Chip
-                                component="a"
-                                href={srv.repositoryUrl}
-                                clickable
-                                icon={<OpenInNewIcon sx={{ fontSize: 12 }} />}
-                                label="Repository"
-                                size="small"
-                                sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.7rem', height: 22 }}
-                              />
-                            )}
-                          </Box>
-                        </Box>
-
-                        {devMode && (
-                          <Box sx={{ mb: 2 }}>
-                            {regDetailLoading && expandedServer === srv.name ? (
-                              <CircularProgress size={14} sx={{ color: c.text.ghost }} />
-                            ) : regDetail && regDetail.name === srv.name ? (
-                              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-                                {(regDetail.keywords?.length > 0 || regDetail.license) && (
-                                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, alignItems: 'center' }}>
-                                    {regDetail.license && (
-                                      <Chip label={regDetail.license} size="small" sx={{ bgcolor: `${c.status.info}15`, color: c.status.info, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
-                                    )}
-                                    {regDetail.keywords?.map((kw) => (
-                                      <Chip key={kw} label={kw} size="small" sx={{ bgcolor: c.bg.secondary, color: c.text.muted, fontSize: '0.65rem', height: 18, '& .MuiChip-label': { px: 0.6 } }} />
-                                    ))}
-                                  </Box>
-                                )}
-                                {regDetail.environmentVariables?.length > 0 && (
-                                  <Box sx={{ bgcolor: c.bg.page, borderRadius: 1.5, border: `1px solid ${c.border.subtle}`, px: 1.5, py: 1 }}>
-                                    <Typography sx={{ color: c.text.muted, fontSize: '0.7rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em', mb: 0.75 }}>
-                                      Required Environment Variables
-                                    </Typography>
-                                    {regDetail.environmentVariables.map((ev) => (
-                                      <Box key={ev.name} sx={{ display: 'flex', alignItems: 'baseline', gap: 1, py: 0.25 }}>
-                                        <Typography sx={{ color: c.accent.primary, fontSize: '0.75rem', fontFamily: c.font.mono, fontWeight: 600, flexShrink: 0 }}>
-                                          {ev.name}
-                                        </Typography>
-                                        {ev.description && (
-                                          <Typography sx={{ color: c.text.ghost, fontSize: '0.72rem' }}>
-                                            {ev.description}
-                                          </Typography>
-                                        )}
-                                      </Box>
-                                    ))}
-                                  </Box>
-                                )}
-                              </Box>
-                            ) : null}
-                          </Box>
-                        )}
-
-                        <Box sx={{ display: 'flex', gap: 1 }}>
-                          <Button
-                            size="small"
-                            variant="contained"
-                            startIcon={<DownloadIcon sx={{ fontSize: 14 }} />}
-                            onClick={(e) => { e.stopPropagation(); handleInstall(srv); }}
-                            sx={{ bgcolor: c.accent.primary, '&:hover': { bgcolor: c.accent.pressed }, textTransform: 'none', fontSize: '0.78rem', borderRadius: 1.5, py: 0.5 }}
-                          >
-                            Install
-                          </Button>
-                          <Button
-                            size="small"
-                            variant="outlined"
-                            startIcon={<EditIcon sx={{ fontSize: 14 }} />}
-                            onClick={(e) => { e.stopPropagation(); handleEditInstall(srv); }}
-                            sx={{ borderColor: c.border.strong, color: c.text.secondary, '&:hover': { borderColor: c.accent.primary, color: c.text.primary }, textTransform: 'none', fontSize: '0.78rem', borderRadius: 1.5, py: 0.5 }}
-                          >
-                            Edit & Install
-                          </Button>
-                        </Box>
-                      </Box>
-                    </Collapse>
-                  </Box>
-                );
-              })}
-
-              {regServers.length < regTotal && (
-                <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
-                  <Button
-                    onClick={handleLoadMore}
-                    disabled={regLoading}
-                    sx={{ color: c.accent.primary, textTransform: 'none', fontSize: '0.85rem' }}
-                  >
-                    {regLoading ? <CircularProgress size={16} sx={{ color: c.accent.primary, mr: 1 }} /> : null}
-                    Load More
-                  </Button>
-                </Box>
-              )}
-            </Box>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setRegistryOpen(false)} sx={{ color: c.text.tertiary, textTransform: 'none' }}>Close</Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={mcpConfigOpen}
-        onClose={() => setMcpConfigOpen(false)}
-        maxWidth="sm"
-        fullWidth
-        PaperProps={{ sx: { bgcolor: c.bg.surface, backgroundImage: 'none', borderRadius: 4, border: `1px solid ${c.border.subtle}` } }}
-      >
-        <DialogTitle sx={{ color: c.text.primary, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 1 }}>
-          <ExtensionIcon sx={{ color: c.status.warning }} />
-          Configure MCP Tool
-        </DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2.5, pt: '8px !important' }}>
-          {mcpConfigServer && (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, p: 1.5, bgcolor: c.bg.page, borderRadius: 2, border: `1px solid ${c.border.subtle}` }}>
-              <Avatar
-                src={mcpConfigServer.iconUrl || undefined}
-                sx={{ width: 32, height: 32, bgcolor: c.bg.secondary, fontSize: '0.8rem', fontWeight: 700, color: c.text.muted }}
-              >
-                {mcpConfigServer.iconUrl ? null : (mcpConfigServer.title || cleanServerName(mcpConfigServer.name)).charAt(0).toUpperCase()}
-              </Avatar>
-              <Box>
-                <Typography sx={{ color: c.text.primary, fontWeight: 600, fontSize: '0.9rem' }}>
-                  {mcpConfigServer.title || cleanServerName(mcpConfigServer.name)}
-                </Typography>
-                <Typography sx={{ color: c.text.tertiary, fontSize: '0.78rem' }}>{mcpConfigServer.description}</Typography>
-              </Box>
-            </Box>
-          )}
-
-          <TextField
-            label="MCP Config (JSON)"
-            value={mcpConfigJson}
-            onChange={(e) => { setMcpConfigJson(e.target.value); try { JSON.parse(e.target.value); setMcpConfigError(''); } catch { setMcpConfigError('Invalid JSON'); } }}
-            fullWidth
-            multiline
-            minRows={3}
-            maxRows={8}
-            error={!!mcpConfigError}
-            helperText={mcpConfigError || 'Transport config passed to claude_agent_sdk (type, url, command, args, etc.)'}
-            sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.page, fontFamily: c.font.mono, fontSize: '0.85rem' } }}
-          />
-
-          <FormControl fullWidth size="small">
-            <InputLabel sx={{ color: c.text.tertiary }}>Authentication Type</InputLabel>
-            <Select
-              value={mcpAuthType}
-              label="Authentication Type"
-              onChange={(e) => {
-                const val = e.target.value as 'none' | 'env_vars';
-                setMcpAuthType(val);
-                if (val === 'env_vars') setMcpCredentials({ API_KEY: '' });
-                else setMcpCredentials({});
-              }}
-              sx={{ bgcolor: c.bg.page }}
-            >
-              <MenuItem value="none">None</MenuItem>
-              <MenuItem value="env_vars">API Keys / Env Vars</MenuItem>
-            </Select>
-          </FormControl>
-
-          {mcpAuthType !== 'none' && (
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5, p: 1.5, bgcolor: c.bg.page, borderRadius: 2, border: `1px solid ${c.border.subtle}` }}>
-              <Typography sx={{ color: c.text.muted, fontSize: '0.78rem', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-                Environment Variables
-              </Typography>
-              {Object.entries(mcpCredentials).map(([key, val]) => (
-                <TextField
-                  key={key}
-                  label={key}
-                  value={val}
-                  onChange={(e) => setMcpCredentials({ ...mcpCredentials, [key]: e.target.value })}
-                  fullWidth
-                  size="small"
-                  type={key.toLowerCase().includes('secret') ? 'password' : 'text'}
-                  sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.elevated, fontFamily: c.font.mono, fontSize: '0.85rem' } }}
-                />
-              ))}
-              {mcpAuthType === 'env_vars' && (
-                <Button
-                  size="small"
-                  onClick={() => setMcpCredentials({ ...mcpCredentials, [`VAR_${Object.keys(mcpCredentials).length + 1}`]: '' })}
-                  sx={{ color: c.accent.primary, textTransform: 'none', fontSize: '0.78rem', alignSelf: 'flex-start' }}
-                >
-                  + Add Variable
-                </Button>
-              )}
-            </Box>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setMcpConfigOpen(false)} sx={{ color: c.text.tertiary, textTransform: 'none' }}>Cancel</Button>
-          <Button
-            variant="contained"
-            onClick={handleMcpConfigSave}
-            disabled={!!mcpConfigError}
-            sx={{ bgcolor: c.accent.primary, '&:hover': { bgcolor: c.accent.pressed }, textTransform: 'none', borderRadius: 2 }}
-          >
-            Install Tool
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={deviceCodeDialogOpen}
-        onClose={() => { if (deviceCodeStatus !== 'loading') setDeviceCodeDialogOpen(false); }}
-        maxWidth="xs"
-        fullWidth
-        PaperProps={{ sx: { bgcolor: c.bg.surface, backgroundImage: 'none', borderRadius: 4, border: `1px solid ${c.border.subtle}` } }}
-      >
-        <DialogTitle sx={{ color: c.text.primary, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 1.5 }}>
-          <Box sx={{ width: 32, height: 32, borderRadius: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: '#0078D418' }}>
-            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M11.4 24H0V12.6L11.4 24zM24 24H12.6V12.6L24 24zM11.4 11.4H0V0l11.4 11.4zM24 11.4H12.6V0L24 11.4z" fill="#0078D4"/></svg>
-          </Box>
-          Connect Microsoft 365
-        </DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
-          {deviceCodeStatus === 'loading' && (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, py: 3, justifyContent: 'center' }}>
-              <CircularProgress size={20} />
-              <Typography sx={{ color: c.text.muted, fontSize: '0.9rem' }}>Generating login code...</Typography>
-            </Box>
-          )}
-          {deviceCodeStatus === 'awaiting' && (
-            <>
-              <Typography sx={{ color: c.text.muted, fontSize: '0.85rem', lineHeight: 1.6 }}>
-                Open the link below and enter the code to sign in:
-              </Typography>
-              <Box sx={{ bgcolor: c.bg.page, border: `1px solid ${c.border.subtle}`, borderRadius: 2, p: 2, display: 'flex', flexDirection: 'column', gap: 1.5, alignItems: 'center' }}>
-                <Typography component="a" href={deviceCodeUrl} target="_blank" rel="noopener" sx={{ color: c.status.info, fontSize: '0.9rem', fontWeight: 500 }}>
-                  {deviceCodeUrl}
-                </Typography>
-                <Typography sx={{ fontFamily: c.font.mono, fontSize: '1.5rem', fontWeight: 700, color: c.text.primary, letterSpacing: 2 }}>
-                  {deviceCode}
-                </Typography>
-              </Box>
-              <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, justifyContent: 'center', py: 1 }}>
-                <CircularProgress size={14} />
-                <Typography sx={{ color: c.text.ghost, fontSize: '0.8rem' }}>Waiting for you to sign in...</Typography>
-              </Box>
-            </>
-          )}
-          {deviceCodeStatus === 'connected' && (
-            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 2, justifyContent: 'center' }}>
-              <CheckCircleIcon sx={{ color: c.status.success, fontSize: 20 }} />
-              <Typography sx={{ color: c.status.success, fontSize: '0.9rem', fontWeight: 500 }}>Connected successfully!</Typography>
-            </Box>
-          )}
-          {deviceCodeStatus === 'error' && (
-            <Typography sx={{ color: c.status.error, fontSize: '0.85rem', py: 2, textAlign: 'center' }}>
-              Login failed. Please try again.
-            </Typography>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setDeviceCodeDialogOpen(false)} sx={{ color: c.text.muted, textTransform: 'none' }}>
-            {deviceCodeStatus === 'connected' ? 'Done' : 'Cancel'}
-          </Button>
-        </DialogActions>
-      </Dialog>
-
-      <Dialog
-        open={credDialogOpen}
-        onClose={() => setCredDialogOpen(false)}
-        maxWidth="sm"
-        fullWidth
-        PaperProps={{ sx: { bgcolor: c.bg.surface, backgroundImage: 'none', borderRadius: 4, border: `1px solid ${c.border.subtle}` } }}
-      >
-        <DialogTitle sx={{ color: c.text.primary, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 1.5 }}>
-          {credDialogIntegration && (
-            <Box sx={{
-              width: 32, height: 32, borderRadius: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'center',
-              bgcolor: `${credDialogIntegration.color}18`, fontSize: '1rem', fontWeight: 700, color: credDialogIntegration.color,
-            }}>
-              {credDialogIntegration.icon}
-            </Box>
-          )}
-          {credDialogIntegration?.connectLabel || 'Connect'}
-        </DialogTitle>
-        <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '8px !important' }}>
-          {credDialogIntegration?.id === 'slack' ? (
-            <Typography sx={{ color: c.text.muted, fontSize: '0.85rem', lineHeight: 1.5, bgcolor: c.bg.secondary, px: 2, py: 1.5, borderRadius: 2, border: `1px solid ${c.border.subtle}` }}>
-              Click <strong>Sign in with Slack</strong> below; a Slack window will open. Sign in normally and the window will close automatically once you reach your workspace.
-            </Typography>
-          ) : (
-            <>
-              {credDialogIntegration?.connectInstructions && (
-                <Typography sx={{ color: c.text.muted, fontSize: '0.85rem', lineHeight: 1.5, bgcolor: c.bg.secondary, px: 2, py: 1.5, borderRadius: 2, border: `1px solid ${c.border.subtle}` }}>
-                  {credDialogIntegration.connectInstructions}
-                </Typography>
-              )}
-              {(credDialogIntegration?.credentialFields || []).map((field) => (
-                <TextField
-                  key={field.key}
-                  label={field.label}
-                  placeholder={field.placeholder}
-                  value={credDialogValues[field.key] || ''}
-                  onChange={(e) => setCredDialogValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
-                  fullWidth
-                  size="small"
-                  helperText={field.helpText}
-                  sx={{ '& .MuiOutlinedInput-root': { bgcolor: c.bg.page, fontFamily: c.font.mono, fontSize: '0.85rem' } }}
-                />
-              ))}
-            </>
-          )}
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setCredDialogOpen(false)} sx={{ color: c.text.tertiary, textTransform: 'none' }}>Cancel</Button>
-          <Button
-            variant="contained"
-            onClick={credDialogIntegration?.id === 'slack' ? handleSlackAutoConnect : handleCredentialsSave}
-            disabled={credDialogSaving || (credDialogIntegration?.id !== 'slack' && (credDialogIntegration?.credentialFields || []).some((f) => !credDialogValues[f.key]?.trim()))}
-            startIcon={credDialogSaving ? <CircularProgress size={14} /> : <LinkIcon sx={{ fontSize: 14 }} />}
-            sx={{ bgcolor: credDialogIntegration?.color || c.accent.primary, '&:hover': { bgcolor: credDialogIntegration?.color || c.accent.pressed, filter: 'brightness(0.9)' }, textTransform: 'none', borderRadius: 2 }}
-          >
-            {credDialogIntegration?.id === 'slack' ? (credDialogSaving ? 'Waiting for sign-in…' : 'Sign in with Slack') : 'Connect'}
-          </Button>
-        </DialogActions>
-      </Dialog>
+        regStats={regStats}
+        regSource={regSource}
+        devMode={devMode}
+        regQuery={regQuery}
+        onRegSearch={handleRegSearch}
+        regSort={regSort}
+        onRegSort={handleRegSort}
+        onRegSourceFilter={handleRegSourceFilter}
+        regLoading={regLoading}
+        regServers={regServers}
+        regTotal={regTotal}
+        allTools={allTools}
+        expandedServer={expandedServer}
+        onExpandServer={(srv, next) => {
+          setExpandedServer(next);
+          if (next && devMode) {
+            dispatch(clearDetail());
+            dispatch(fetchServerDetail(srv.name));
+          }
+        }}
+        regDetail={regDetail}
+        regDetailLoading={regDetailLoading}
+        onInstall={handleInstall}
+        onEditInstall={handleEditInstall}
+        onLoadMore={handleLoadMore}
+      />
 
       <Snackbar
         open={snackbar.open}
