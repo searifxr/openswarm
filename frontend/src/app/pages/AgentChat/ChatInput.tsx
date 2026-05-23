@@ -801,12 +801,15 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   // document→image rewrite); refused on OpenAI/OpenRouter/custom until
   // we land file-parser plugin / type:file translation.
   // Mirrors backend agent_manager._resolve_attachments support matrix.
-  // PDFs: Anthropic, Gemini, OpenRouter (all empirically verified May
-  // 2026 via probe-pdf-roundtrip.py). OpenAI direct refused because
-  // OpenAI's image_url rejects non-image mime; user should switch to
-  // openrouter/openai/gpt-5 for OpenAI-via-OR with PDF support.
+  // PDFs: Anthropic, Gemini, OpenRouter (file-parser plugin), and
+  // OpenAI direct on GPT-5.x non-Codex (anthropic_proxy bypasses
+  // 9router and POSTs to api.openai.com via anthropic_to_openai.py).
   // Images: every provider via 9router image_url translation.
-  const pdfSupported = ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(currentModelApi);
+  const isCodexModel = typeof model === 'string' && (model.toLowerCase().includes('codex') || model.toLowerCase().startsWith('cx/'));
+  const pdfSupported = (
+    ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(currentModelApi) ||
+    (currentModelApi === 'openai' && !isCodexModel)
+  );
   const imageSupported = ['anthropic', 'gemini', 'gemini-cli', 'openai', 'openrouter'].includes(currentModelApi);
 
   const pendingPayloadEstimate = useMemo(() => {
@@ -2255,7 +2258,11 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
                           {(() => {
                             const win = (opt.context_window as number) || 0;
                             const api = (opt.api as string || 'anthropic').toLowerCase();
-                            const optSupportsPdf = ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(api);
+                            const optIsCodex = typeof opt.value === 'string' && (opt.value.toLowerCase().includes('codex') || opt.value.toLowerCase().startsWith('cx/'));
+                            const optSupportsPdf = (
+                              ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(api) ||
+                              (api === 'openai' && !optIsCodex)
+                            );
                             const optSupportsImage = ['anthropic', 'gemini', 'gemini-cli', 'openai', 'openrouter'].includes(api);
                             const cannotPdf = pendingKinds.has('pdf') && !optSupportsPdf;
                             const cannotImg = pendingKinds.has('image') && !optSupportsImage;

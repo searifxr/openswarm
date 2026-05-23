@@ -1187,15 +1187,16 @@ class AgentManager:
         #   - Anthropic: native document blocks pass through cleanly.
         #   - Gemini: anthropic_proxy rewrites document → image_url with
         #     data:application/pdf base64; 9router translates to Gemini
-        #     inlineData natively. VERIFIED empirically May 2026 (47K
-        #     prompt tokens, real PaLM content summarized).
+        #     inlineData natively.
         #   - OpenRouter: file-parser plugin injected in anthropic-proxy.
-        #   - OpenAI: REFUSED. OpenAI's image_url only accepts image/*
-        #     mime; the type:file shape gets stringified by 9router.
-        #     Workaround: route through `openrouter/openai/gpt-5` which
-        #     uses OR's file-parser plugin.
+        #   - OpenAI direct (GPT-5.x non-codex): anthropic_proxy detects
+        #     document block + bypasses 9router entirely, translating
+        #     to OpenAI Chat Completions and streaming response back
+        #     via anthropic_to_openai.py. Requires openai_api_key.
         #   - Codex (cx/): models don't support PDFs.
-        supports_pdf = api in ("anthropic", "gemini", "gemini-cli", "openrouter")
+        supports_pdf = api in ("anthropic", "gemini", "gemini-cli", "openrouter", "openai")
+        if api == "openai" and isinstance(model, str) and ("codex" in model.lower() or model.lower().startswith("cx/")):
+            supports_pdf = False
 
         # Per-file inline caps (raw bytes, before base64). Going over
         # means the request would 4xx, blow our 64MB SDK buffer, or

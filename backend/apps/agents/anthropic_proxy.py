@@ -387,6 +387,45 @@ async def proxy(rest: str, request: Request):
         except Exception:
             pass
 
+    # 9router-bypass paths for PDF-bearing requests on providers where
+    # 9router 0.3.60 strips or mangles the relevant content/plugin
+    # fields. We translate + POST directly to the provider's API and
+    # convert the streaming response back to Anthropic SSE so the
+    # bundled Claude CLI subprocess consumes it unchanged.
+    try:
+        parsed_for_bypass = json.loads(body) if body else None
+    except Exception:
+        parsed_for_bypass = None
+    if isinstance(parsed_for_bypass, dict):
+        from backend.apps.agents.anthropic_to_openai import (
+            should_bypass_9router as _should_bypass_oai,
+            should_bypass_9router_for_openrouter as _should_bypass_or,
+            forward_to_openai as _forward_oai,
+            forward_to_openrouter as _forward_or,
+        )
+        from backend.apps.settings.settings import load_settings as _load
+        _s = _load()
+        if _is_openai_max_completion_tokens_model(model):
+            _oak = (getattr(_s, "openai_api_key", "") or "").strip()
+            if _should_bypass_oai(parsed_for_bypass, _oak):
+                status, body_stream, hdrs = await _forward_oai(
+                    parsed_for_bypass, _oak, dict(request.headers),
+                )
+                return StreamingResponse(
+                    body_stream, status_code=status, headers=hdrs,
+                    media_type=hdrs.get("content-type", "text/event-stream"),
+                )
+        if _is_openrouter_model(model):
+            _ork = (getattr(_s, "openrouter_api_key", "") or "").strip()
+            if _should_bypass_or(parsed_for_bypass, _ork):
+                status, body_stream, hdrs = await _forward_or(
+                    parsed_for_bypass, _ork, dict(request.headers),
+                )
+                return StreamingResponse(
+                    body_stream, status_code=status, headers=hdrs,
+                    media_type=hdrs.get("content-type", "text/event-stream"),
+                )
+
     if _is_gemini_model(model):
         body = _scrub_request_for_gemini(body)
     if _is_openai_max_completion_tokens_model(model):

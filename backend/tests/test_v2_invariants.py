@@ -1677,13 +1677,11 @@ def test_resolve_attachments_anthropic_emits_native_document():
         os.unlink(path)
 
 
-def test_resolve_attachments_openai_refuses_pdf_with_openrouter_hint():
-    """Empirical probe May 2026: OpenAI image_url rejects non-image mime
-    types with HTTP 400 'Invalid MIME type'. The type:file shape gets
-    stringified by 9router 0.3.60. Until we write a 9router-bypass
-    direct-API translator, refuse OpenAI PDFs with switch hint to
-    openrouter/openai/gpt-5 which has working PDF support via OR's
-    file-parser plugin."""
+def test_resolve_attachments_openai_accepts_pdf_via_bypass_translator():
+    """OpenAI GPT-5.x non-codex accepts PDFs because anthropic_proxy
+    detects document blocks + bypasses 9router via anthropic_to_openai.
+    No refusal at agent_manager level; the bypass kicks in at proxy
+    time when openai_api_key is set."""
     import tempfile, os
     from backend.apps.agents.agent_manager import AgentManager
     mgr = AgentManager()
@@ -1694,12 +1692,81 @@ def test_resolve_attachments_openai_refuses_pdf_with_openrouter_hint():
         _text, native, refusals = mgr._resolve_attachments(
             [{"path": path, "type": "file"}], api_type="openai", model="gpt-5.5",
         )
-        assert not native
-        assert refusals
-        joined = " ".join(refusals).lower()
-        assert "openrouter" in joined or "claude" in joined
+        assert native and native[0]["type"] == "document"
+        assert not refusals
     finally:
         os.unlink(path)
+
+
+def test_bypass_estimate_body_bytes_sums_image_url_and_file_blocks():
+    """The size estimator must sum payload bytes across BOTH content
+    types the translator emits (image_url with data: URL, file with
+    file_data) so the pre-flight reject can fire before httpx serializes."""
+    from backend.apps.agents.anthropic_to_openai import _estimate_body_bytes
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "hi"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},  # 8 bytes b64
+        {"type": "file", "file": {"file_data": "data:application/pdf;base64,RUZHSA=="}},  # 8 bytes b64
+    ]}]}
+    assert _estimate_body_bytes(body) == 16
+
+
+def test_bypass_concurrency_semaphore_serializes_excess_requests():
+    """The semaphore caps in-flight bypass requests to prevent OOM. Cap=2
+    means a third concurrent request waits rather than allocating another
+    ~40MB buffer."""
+    from backend.apps.agents.anthropic_to_openai import _bypass_sema, _BYPASS_CONCURRENCY
+    assert _BYPASS_CONCURRENCY == 2
+    # Initial value matches the cap (no in-flight at import time).
+    assert _bypass_sema._value == _BYPASS_CONCURRENCY
+
+
+def test_anthropic_to_openai_should_bypass_fires_for_gpt5_pdf():
+    """The bypass only fires for: GPT-5.x non-codex + has document block
+    + openai_api_key set. Misses any of those: 9router path."""
+    from backend.apps.agents.anthropic_to_openai import should_bypass_9router
+    body = {"model": "gpt-5.5", "messages": [{"role": "user", "content": [
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "x"}},
+    ]}]}
+    assert should_bypass_9router(body, "sk-abc")
+    assert not should_bypass_9router(body, None)
+    assert not should_bypass_9router(body, "")
+    assert not should_bypass_9router({**body, "model": "gpt-5.3-codex"}, "sk-abc")
+    body_no_doc = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+    assert not should_bypass_9router(body_no_doc, "sk-abc")
+    body_with_tools = {**body, "tools": [{"name": "x"}]}
+    assert not should_bypass_9router(body_with_tools, "sk-abc")
+
+
+def test_anthropic_to_openai_request_translation_shape():
+    """Translator must produce a valid OpenAI Chat Completions body."""
+    from backend.apps.agents.anthropic_to_openai import translate_request
+    body = {
+        "model": "gpt-5.5",
+        "max_tokens": 200,
+        "system": "You are helpful.",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "summarize"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0=",
+                }},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBOR=",
+                }},
+            ],
+        }],
+    }
+    out = translate_request(body)
+    assert out["model"] == "gpt-5.5"
+    assert out["stream"] is True
+    assert out["max_completion_tokens"] == 200
+    assert out["messages"][0] == {"role": "system", "content": "You are helpful."}
+    user_content = out["messages"][1]["content"]
+    assert any(p["type"] == "text" and p["text"] == "summarize" for p in user_content)
+    assert any(p["type"] == "file" and p["file"]["file_data"].startswith("data:application/pdf;base64,") for p in user_content)
+    assert any(p["type"] == "image_url" and p["image_url"]["url"].startswith("data:image/png;base64,") for p in user_content)
 
 
 def test_resolve_attachments_gemini_emits_native_document_after_translator_fix():
