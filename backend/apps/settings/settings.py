@@ -64,9 +64,36 @@ async def settings_lifespan():
             await sync_custom_providers(getattr(s, "custom_providers", None) or [])
 
         _asyncio.create_task(_boot_router_then_sync())
+        _asyncio.create_task(_upload_dir_gc_loop())
     except Exception as e:
         logger.warning(f"9Router sync startup failed: {e}")
     yield
+
+
+async def _upload_dir_gc_loop():
+    """Daily GC of UPLOAD_DIR. Without this, every PDF/image the user
+    drops sits in the OS temp dir forever, growing unbounded across
+    sessions. We keep files for 7 days to make resume-after-restart
+    work, then delete. macOS temp under /var/folders/... is auto-purged
+    by the OS but not aggressively; Windows temp is not. Belt and braces.
+    Errors are swallowed: a chmod hiccup or in-use lock should never
+    crash the backend."""
+    import asyncio as _a
+    while True:
+        try:
+            now = time.time()
+            cutoff = now - 7 * 86400
+            if os.path.isdir(UPLOAD_DIR):
+                for entry in os.listdir(UPLOAD_DIR):
+                    p = os.path.join(UPLOAD_DIR, entry)
+                    try:
+                        if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                            os.remove(p)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        await _a.sleep(24 * 3600)
 
 
 settings = SubApp("settings", settings_lifespan)
@@ -311,27 +338,257 @@ UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "self-swarm-uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+def _sniff_file_kind(contents: bytes, name: str) -> tuple[str, str | None]:
+    """Classify an uploaded file as text/pdf/image/binary so the agent
+    layer can route it (inline as text, send as native document/image
+    block, or refuse). Returns (kind, media_type)."""
+    head = contents[:4096]
+    if head.startswith(b"%PDF-"):
+        return ("pdf", "application/pdf")
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ("image", "image/png")
+    if head.startswith(b"\xff\xd8\xff"):
+        return ("image", "image/jpeg")
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+        return ("image", "image/gif")
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ("image", "image/webp")
+    # Other common binary signatures that don't contain a null byte in the
+    # first few bytes (so the null-byte fallback below would miss them):
+    # zip/docx/xlsx/pptx/jar/apk/odt (PK\x03\x04), gzip (\x1f\x8b),
+    # 7z (7z\xbc\xaf), tar (ustar magic at offset 257), rar (Rar!\x1a\x07),
+    # ELF (\x7fELF), Mach-O (\xfe\xed\xfa\xce / \xce\xfa\xed\xfe), Win exe
+    # (MZ), Java class (\xca\xfe\xba\xbe), sqlite (SQLite format 3\x00).
+    if (head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or
+        head.startswith(b"\x1f\x8b") or head.startswith(b"7z\xbc\xaf\x27\x1c") or
+        head.startswith(b"Rar!\x1a\x07") or head.startswith(b"\x7fELF") or
+        head.startswith(b"\xfe\xed\xfa\xce") or head.startswith(b"\xce\xfa\xed\xfe") or
+        head.startswith(b"\xfe\xed\xfa\xcf") or head.startswith(b"\xcf\xfa\xed\xfe") or
+        head.startswith(b"MZ") or head.startswith(b"\xca\xfe\xba\xbe") or
+        head.startswith(b"SQLite format 3\x00")):
+        return ("binary", None)
+    # Binary heuristic: any null bytes in the first 4KB is a strong "not text" signal.
+    # Falls back gracefully for unusual encodings (UTF-16 has nulls too, but we treat
+    # those as binary for safety since the agent's `open(..., "r")` would misread them).
+    if b"\x00" in head:
+        return ("binary", None)
+    try:
+        head.decode("utf-8")
+        return ("text", "text/plain")
+    except UnicodeDecodeError:
+        return ("binary", None)
+
+
+def _estimate_pdf_tokens(contents: bytes) -> int:
+    """Conservative PDF token estimate without a parser dep.
+
+    We use two signals and take the MAX so the chip + dry-run never
+    under-report:
+
+      1) Page count from the PDF catalog (regex over /Type /Pages /Count
+         then a fallback for /Count just before /Kids). When found, we
+         estimate 750 tokens/page, a fair midpoint between dense academic
+         papers (~1200) and sparse decks (~300).
+      2) Byte-size heuristic. PDFs compress text and embed images; the
+         actual token cost on Anthropic's vision tier scales with file
+         size. ~1 token per 80 bytes is conservative.
+
+    Taking max() means a small page count on a huge PDF (image-heavy)
+    still reads as expensive, and a huge page count on a small PDF still
+    reads as expensive. The chip never lies that an attachment is cheap."""
+    import re as _re
+    by_pages = 0
+    try:
+        # Prefer the root catalog's /Pages entry. PDFs can have nested
+        # /Count fields (outlines, sub-pages), so anchor on /Type /Pages.
+        m = _re.search(rb"/Type\s*/Pages\b[^>]{0,200}?/Count\s+(\d+)", contents, _re.DOTALL)
+        if not m:
+            # Fallback: catalog declares /Pages then references /Count via /Kids.
+            m = _re.search(rb"/Pages[^>]{0,200}?/Count\s+(\d+)", contents, _re.DOTALL)
+        if m:
+            pages = int(m.group(1))
+            if 0 < pages < 10_000:
+                by_pages = pages * 750
+    except Exception:
+        pass
+    by_bytes = max(1_000, min(len(contents) // 80, 2_000_000))
+    return max(by_pages, by_bytes)
+
+
 @settings.router.post("/upload-files")
 async def upload_files(files: list[UploadFile] = File(...)):
-    """Accept dropped files, save them, and return their server-side paths."""
+    """Accept dropped files, sniff their kind, save them, and return
+    server-side paths + a `kind` + `tokens` estimate per file.
+
+    The chat UI uses `tokens` for the per-chip chip count and the pre-send
+    dry-run guard; it uses `kind` to decide whether the file routes as
+    inline text, a native document block (PDF on Anthropic/Gemini), an
+    image block (vision-capable models), or gets refused (other binary,
+    until we add Files API support).
+
+    Estimates per kind:
+      - text: char/4 of the actually-readable text (capped at 512KB)
+      - pdf:  page-count * 750 (conservative; real text-heavy PDFs run
+              ~500-1200 tokens/page)
+      - image: 1500 (Anthropic's per-image baseline; varies by size)
+      - binary: 0 (refused at agent time, won't enter context)
+    """
     results = []
     for f in files:
         safe_name = os.path.basename(f.filename or "untitled")
-        dest = os.path.join(UPLOAD_DIR, safe_name)
-
-        counter = 1
-        base, ext = os.path.splitext(safe_name)
-        while os.path.exists(dest):
-            dest = os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")
-            counter += 1
-
+        # Strip path separators that survived basename on Windows-typed
+        # uploads where filename arrived with backslashes preserved.
+        safe_name = safe_name.replace("\\", "_").replace("/", "_") or "untitled"
         contents = await f.read()
-        with open(dest, "wb") as fh:
-            fh.write(contents)
 
-        results.append({"path": dest, "name": safe_name, "size": len(contents)})
+        # Atomic create-with-collision-retry so two concurrent uploads with
+        # the same filename never overwrite each other. The previous
+        # exists() then open() pattern had a race window: both callers
+        # would observe `dest` free and both would write, with the second
+        # winning. O_EXCL fails the create if anyone else got there first.
+        base, ext = os.path.splitext(safe_name)
+        dest = os.path.join(UPLOAD_DIR, safe_name)
+        counter = 0
+        fd = None
+        while fd is None:
+            try:
+                fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                counter += 1
+                if counter > 10_000:
+                    raise HTTPException(status_code=500, detail="upload dedup exhausted")
+                dest = os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(contents)
+        except Exception:
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            raise
+
+        kind, media_type = _sniff_file_kind(contents, safe_name)
+
+        if kind == "text":
+            try:
+                with open(dest, "r", errors="replace") as fh:
+                    txt = fh.read(512_000)
+                tokens_est = max(0, len(txt) // 4)
+            except Exception:
+                tokens_est = min(len(contents), 512_000) // 4
+        elif kind == "pdf":
+            tokens_est = _estimate_pdf_tokens(contents)
+        elif kind == "image":
+            tokens_est = 1_500
+        else:
+            tokens_est = 0
+
+        results.append({
+            "path": dest,
+            "name": safe_name,
+            "size": len(contents),
+            "tokens": tokens_est,
+            "kind": kind,
+            "media_type": media_type,
+        })
 
     return JSONResponse({"files": results})
+
+
+class _SummarizeRequest(BaseModel):
+    path: str
+    target_tokens: int = 4_000
+    primary_model: Optional[str] = None
+
+
+@settings.router.post("/summarize-file")
+async def summarize_file(req: _SummarizeRequest):
+    """Compress an attached file down to a fact-dense summary the agent can
+    still reason over without paying the full token cost.
+
+    Called from the chat-input attach handler when one file alone would
+    exceed 50% of the selected model's context window. The summary is
+    written to a sibling file with `.summary.txt` suffix in UPLOAD_DIR so
+    the existing attachment plumbing (paths flow through context_paths)
+    works unchanged. Aux model picked via provider-agnostic
+    resolve_aux_model, so users on OpenAI/Gemini/OpenRouter get summarized
+    via their own provider's cheap tier (never hardcoded to Haiku).
+    """
+    src = req.path
+    if not os.path.isfile(src):
+        raise HTTPException(status_code=404, detail="file not found")
+    if not os.path.commonpath([os.path.realpath(src), os.path.realpath(UPLOAD_DIR)]) == os.path.realpath(UPLOAD_DIR):
+        raise HTTPException(status_code=400, detail="path outside upload dir")
+
+    try:
+        with open(src, "r", errors="replace") as fh:
+            raw = fh.read(2_000_000)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"read failed: {e}")
+
+    if (len(raw) // 4) <= max(1, req.target_tokens):
+        return JSONResponse({"path": src, "tokens": len(raw) // 4, "size": len(raw), "summarized": False})
+
+    try:
+        from backend.apps.agents.providers.registry import resolve_aux_model, get_api_type
+        from backend.apps.settings.credentials import get_anthropic_client_for_model
+        s = load_settings()
+        aux_model, _base = await resolve_aux_model(
+            s,
+            preferred_tier="haiku",
+            primary_api=get_api_type(req.primary_model) if req.primary_model else None,
+        )
+        client = get_anthropic_client_for_model(s, aux_model)
+        system = (
+            "You compress a document into a fact-dense summary while preserving every "
+            "specific entity, number, date, quote, code identifier, and decision. Use "
+            "short bullets grouped by section. Never invent. If a section is unclear, "
+            "say so. Aim for roughly the target token budget."
+        )
+        user = (
+            f"Target length: ~{req.target_tokens} tokens.\n\n"
+            f"<document path=\"{os.path.basename(src)}\">\n{raw}\n</document>\n\n"
+            "Summary:"
+        )
+        resp = await client.messages.create(
+            model=aux_model,
+            max_tokens=min(8_192, max(512, req.target_tokens + 1_024)),
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        summary = ""
+        try:
+            for b in (getattr(resp, "content", None) or []):
+                t = getattr(b, "text", None)
+                if isinstance(t, str) and t:
+                    summary += t
+        except Exception:
+            summary = ""
+        if not summary.strip():
+            raise RuntimeError("empty summary from aux model")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"summarize failed: {e}")
+
+    base, _ext = os.path.splitext(src)
+    dest = f"{base}.summary.txt"
+    counter = 1
+    while os.path.exists(dest):
+        dest = f"{base}.summary_{counter}.txt"
+        counter += 1
+    body = (
+        f"Summary of {os.path.basename(src)} "
+        f"(compressed from ~{len(raw) // 4} tokens to ~{len(summary) // 4} tokens)\n\n"
+        f"{summary}\n"
+    )
+    with open(dest, "w") as fh:
+        fh.write(body)
+    return JSONResponse({
+        "path": dest,
+        "tokens": len(body) // 4,
+        "size": len(body),
+        "summarized": True,
+    })
 
 
 @settings.router.get("/browse-directories")

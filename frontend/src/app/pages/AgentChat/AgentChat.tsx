@@ -56,8 +56,9 @@ import { setGlowingBrowserCards, fadeGlowingBrowserCards, clearGlowingBrowserCar
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 
 const CONTEXT_WINDOWS: Record<string, number> = {
-  sonnet: 200_000,
-  opus: 200_000,
+  'opus-4-7': 1_000_000,
+  opus: 1_000_000,
+  sonnet: 1_000_000,
   haiku: 200_000,
 };
 
@@ -619,15 +620,22 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
   }, [id, dispatch, onBranch, session?.dashboard_id]);
 
   const contextEstimate = useMemo(() => {
-    // Look up the actual context window from the models store (backend
-    // registry is the source of truth). Fall back to the legacy hardcoded
-    // map for any model that isn't in the store yet.
+    // Prefer the live API-reported input token count once we have one
+    // (session.tokens.input includes the full request: messages + system +
+    // tool defs + cached prefix). That number is authoritative because
+    // Anthropic counts it against the context window. Before the first
+    // turn completes, fall back to a char/4 estimate of visible message
+    // content as a rough pre-send hint.
     let limit = 0;
     for (const ms of Object.values(modelsByProvider)) {
       const hit = ms.find((m) => m.value === model);
       if (hit?.context_window) { limit = hit.context_window; break; }
     }
-    if (!limit) limit = CONTEXT_WINDOWS[model] || 200_000;
+    if (!limit) limit = (session?.context_window) || CONTEXT_WINDOWS[model] || 200_000;
+    const liveInput = session?.tokens?.input ?? 0;
+    if (liveInput > 0) {
+      return { used: liveInput, limit };
+    }
     let totalChars = 0;
     if (session?.system_prompt) totalChars += session.system_prompt.length;
     for (const msg of activeBranchMessages) {
@@ -640,7 +648,7 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
     // text and re-run this sum on every painted character, defeating
     // the whole point of isolating AgentChat from delta updates. The
     // header gauge will catch up when stream_end commits the message.
-  }, [activeBranchMessages, session?.system_prompt, streamingMessageId, model, modelsByProvider]);
+  }, [activeBranchMessages, session?.system_prompt, session?.tokens?.input, session?.context_window, streamingMessageId, model, modelsByProvider]);
 
   const sessionRunning = session?.status === 'running' || session?.status === 'waiting_approval';
 
@@ -926,16 +934,32 @@ const AgentChat: React.FC<AgentChatProps> = ({ sessionId: sessionIdProp, onClose
                     );
                   })()}
                   {(() => {
-                    const pct = session.ctx_used_pct ?? 0;
-                    if (!pct) return null;
+                    const liveWindow = session.context_window || contextEstimate.limit || 200_000;
+                    const liveInput = session.tokens?.input ?? 0;
+                    const pct = liveInput > 0
+                      ? Math.min(1, liveInput / Math.max(1, liveWindow))
+                      : (contextEstimate.used / Math.max(1, liveWindow));
+                    if (pct <= 0) return null;
                     const pctTxt = `${Math.round(pct * 100)}%`;
-                    const color = pct >= 0.9 ? '#ef4444' : pct >= 0.7 ? '#f59e0b' : c.text.tertiary;
+                    const color = pct >= 0.85 ? '#ef4444' : pct >= 0.60 ? '#f59e0b' : c.text.tertiary;
                     const mcpCount = session.active_mcps?.length ?? 0;
+                    const fwOverhead = session.framework_overhead_tokens ?? 0;
+                    const systemTokens = Math.round((session.system_prompt?.length ?? 0) / 4);
+                    const historyTokens = Math.max(0, contextEstimate.used - systemTokens);
+                    const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+                    const breakdown = [
+                      `Context ${pctTxt} of ${fmt(liveWindow)}`,
+                      liveInput > 0 ? `Reported by API: ${fmt(liveInput)} input tokens` : null,
+                      `History: ~${fmt(historyTokens)}`,
+                      `System prompt: ~${fmt(systemTokens)}`,
+                      fwOverhead > 0 ? `Tools + MCPs + preset: ~${fmt(fwOverhead)}` : null,
+                      `${mcpCount} MCP${mcpCount === 1 ? '' : 's'} active`,
+                    ].filter(Boolean).join(' · ');
                     return (
                       <Typography
                         variant="caption"
                         sx={{ color, fontVariantNumeric: 'tabular-nums' }}
-                        title={`Context ${pctTxt} of 200K · ${mcpCount} MCP${mcpCount === 1 ? '' : 's'} active`}
+                        title={breakdown}
                       >
                         {pctTxt} ctx · {mcpCount} mcp
                       </Typography>

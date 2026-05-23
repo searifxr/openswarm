@@ -300,8 +300,10 @@ _DEFAULT_SYNC_PATH = "/api/service/sync"
 
 
 def submit(kind: str, payload: dict) -> None:
-    """Legacy shim; routes through sync(). Kept for back-compat during
-    migration. New code should call sync() directly."""
+    """Routes through sync(). The cloud demuxes by payload shape (state /
+    sync / diagnostic / event), so kind here is informational; the routing
+    happens server-side in openswarm-cloud/src/routes/service/ingest.ts.
+    New call sites should use sync() directly with a well-shaped payload."""
     sync(payload)
 
 

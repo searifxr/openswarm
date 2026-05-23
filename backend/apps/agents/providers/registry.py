@@ -186,6 +186,43 @@ _or_models_cache: dict = {"models": None, "fetched_at": 0.0, "ok": False}
 _9router_cache: dict = {"available": None, "checked_at": 0}
 
 
+# Per-model published pricing in $/1M tokens (input, output) for direct
+# API key lanes. Sourced from each provider's official pricing page as of
+# May 2026. The Claude Agent SDK ALWAYS computes total_cost_usd at
+# Anthropic rates; for any non-Anthropic upstream the SDK number is
+# 50-1000x wrong and we MUST recompute. Used by agent_manager's cost
+# recompute logic.
+_DIRECT_API_PRICING: dict[str, tuple[float, float]] = {
+    # OpenAI GPT-5.x family (source: platform.openai.com/docs/pricing).
+    "gpt-5.5":             (1.25, 10.00),
+    "gpt-5.4":             (1.25, 10.00),
+    "gpt-5.4-mini":        (0.25,  2.00),
+    "gpt-5.3-codex":       (1.25, 10.00),
+    "gpt-5.3-codex-high":  (1.25, 10.00),
+    "gpt-5.3-codex-xhigh": (1.25, 10.00),
+    # Google Gemini direct API (ai.google.dev/pricing).
+    "gemini-3.1-pro-preview":        (1.25, 10.00),
+    "gemini-3.1-flash-lite-preview": (0.10,  0.40),
+    "gemini-3-pro-preview":          (1.25, 10.00),
+    "gemini-3-flash-preview":        (0.30,  2.50),
+}
+
+
+def get_direct_pricing(model_id: str) -> tuple[float, float] | None:
+    """($/1M input, $/1M output) for an OpenAI or Gemini direct-API model_id.
+    Returns None for any model not in the pricing table; callers fall back
+    to the SDK's (Anthropic-rate) estimate which is wrong but at least
+    deterministic."""
+    if not isinstance(model_id, str):
+        return None
+    bare = model_id
+    for prefix in ("cp-openai/", "cp-gemini/", "cp-google/", "openai/", "google/", "gemini/"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    return _DIRECT_API_PRICING.get(bare)
+
+
 def get_openrouter_pricing(resolved_model: str) -> tuple[float, float] | None:
     """($/1M input, $/1M output) for an openrouter/ id, or None if not cached."""
     if not isinstance(resolved_model, str) or not resolved_model.startswith("openrouter/"):

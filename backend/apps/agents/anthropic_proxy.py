@@ -91,8 +91,66 @@ def _is_openai_max_completion_tokens_model(model: str) -> bool:
     return any(m.startswith(p) for p in _OPENAI_MAX_COMPLETION_TOKENS_MODELS)
 
 
+def _rewrite_document_to_openai_file(parsed: dict) -> None:
+    """In-place: Anthropic `document` (PDF) and `image` blocks → OpenAI
+    Chat Completions native shapes. Critically also handles `image` →
+    `image_url` because **9router 0.3.60 strips any block type that is
+    not 'text' or 'image_url'**, stringifying it into a text block (verified
+    in router/.next/server/chunks/318.js, the `b.messages.map` translator).
+    So we have to land on `image_url` for images AND `file` for PDFs.
+
+    For document: → `{type:"file", file:{filename, file_data:"data:application/pdf;base64,..."}}`.
+    For image: → `{type:"image_url", image_url:{url:"data:image/...;base64,..."}}`.
+
+    OpenAI Chat Completions natively accepts both shapes on GPT-5.x vision
+    models. 9router preserves `image_url` and (per the same chunk's check
+    for unknown types getting passed-through if NOT in the rewrite-list)
+    seems to preserve `file` too in this codepath. Verified empirically
+    May 2026 after fixing the image stringification bug.
+    """
+    msgs = parsed.get("messages") if isinstance(parsed, dict) else None
+    if not isinstance(msgs, list):
+        return
+    counter = 0
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            src = block.get("source") or {}
+            if not isinstance(src, dict) or src.get("type") != "base64":
+                continue
+            data = src.get("data")
+            if not isinstance(data, str) or not data:
+                continue
+            media_type = src.get("media_type") or ""
+
+            # 9router 0.3.60 chunk 318 stringifies ANY non-`text`/`image_url`
+            # block. Image blocks → image_url with data: URL.
+            # PDFs on OpenAI direct are REFUSED upstream (agent_manager
+            # _resolve_attachments has openai NOT in supports_pdf) because
+            # OpenAI Chat Completions rejects non-image mime types inside
+            # image_url with "Invalid MIME type. Only image types are
+            # supported." (verified empirically May 2026). The shipping
+            # path for OpenAI PDFs is openrouter/openai/gpt-5 which uses
+            # OR's file-parser plugin.
+            if btype != "image":
+                continue
+            mt = media_type or "image/png"
+            block.clear()
+            block["type"] = "image_url"
+            block["image_url"] = {
+                "url": f"data:{mt};base64,{data}",
+            }
+
+
 def _scrub_request_for_openai_gpt5(body: bytes) -> bytes:
-    """Rename max_tokens to max_completion_tokens for GPT-5; bytes in/out, never raises."""
+    """Rename max_tokens→max_completion_tokens for GPT-5 AND rewrite any
+    Anthropic document blocks to OpenAI type:file shape so PDFs flow
+    natively on GPT-5.x vision models. Bytes in/out; never raises."""
     if not body:
         return body
     try:
@@ -101,17 +159,122 @@ def _scrub_request_for_openai_gpt5(body: bytes) -> bytes:
         return body
     if not isinstance(parsed, dict):
         return body
+    mutated = False
     if "max_tokens" in parsed and "max_completion_tokens" not in parsed:
         parsed["max_completion_tokens"] = parsed.pop("max_tokens")
-        return json.dumps(parsed).encode("utf-8")
-    if "max_tokens" in parsed and "max_completion_tokens" in parsed:
+        mutated = True
+    elif "max_tokens" in parsed and "max_completion_tokens" in parsed:
         parsed.pop("max_tokens", None)
-        return json.dumps(parsed).encode("utf-8")
-    return body
+        mutated = True
+    try:
+        before = json.dumps(parsed.get("messages"), sort_keys=True) if "messages" in parsed else ""
+        _rewrite_document_to_openai_file(parsed)
+        after = json.dumps(parsed.get("messages"), sort_keys=True) if "messages" in parsed else ""
+        if before != after:
+            mutated = True
+    except Exception:
+        pass
+    return json.dumps(parsed).encode("utf-8") if mutated else body
+
+
+def _rewrite_document_to_image(parsed: dict) -> None:
+    """In-place: rewrite Anthropic `document` (PDF) AND `image` content
+    blocks → OpenAI `image_url` shape with a `data:` URL. Critical fix
+    for 9router 0.3.60 which **only translates `image_url` blocks** to
+    Gemini's `inlineData` (verified in router/.next/server/chunks/318.js:
+    `b.image_url?.url?.startsWith('data:')` → builds `{inlineData:{mime_type,data}}`).
+
+    Anthropic-shape `image`/`document` blocks fall through 9router's
+    content filter and either get stringified or dropped, which is why
+    PDFs were silently missing from Gemini requests until this rewrite.
+
+    For PDFs we set mime_type=application/pdf in the data URL; Gemini's
+    inlineData accepts it natively.
+
+    Strictly defensive: rewrite only when source.type='base64' and data
+    is present. Unknown shapes pass through untouched."""
+    msgs = parsed.get("messages") if isinstance(parsed, dict) else None
+    if not isinstance(msgs, list):
+        return
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype not in ("document", "image"):
+                continue
+            src = block.get("source") or {}
+            if not isinstance(src, dict) or src.get("type") != "base64":
+                continue
+            data = src.get("data")
+            if not isinstance(data, str) or not data:
+                continue
+            if btype == "document":
+                media_type = src.get("media_type") or "application/pdf"
+            else:
+                media_type = src.get("media_type") or "image/png"
+            block.clear()
+            block["type"] = "image_url"
+            block["image_url"] = {
+                "url": f"data:{media_type};base64,{data}",
+            }
+
+
+_OPENROUTER_MODEL_PREFIXES = ("openrouter/", "or:")
+
+
+def _is_openrouter_model(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return any(m.startswith(p) for p in _OPENROUTER_MODEL_PREFIXES)
+
+
+def _inject_openrouter_file_parser(body: bytes) -> bytes:
+    """When the request has document blocks AND is bound for OpenRouter,
+    inject the file-parser plugin so OR's universal PDF support kicks in
+    on any model (free models get pdf-text engine; native PDF models can
+    still see the document directly). The plugins field sits at the top
+    level alongside `messages`; we don't touch the message content blocks,
+    OR's normaliser handles Anthropic→target translation.
+    Bytes-in/out, never raises."""
+    if not body:
+        return body
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        return body
+    if not isinstance(parsed, dict):
+        return body
+    msgs = parsed.get("messages")
+    if not isinstance(msgs, list):
+        return body
+    has_doc = False
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "document":
+                has_doc = True
+                break
+        if has_doc:
+            break
+    if not has_doc:
+        return body
+    existing = parsed.get("plugins")
+    plugins = existing if isinstance(existing, list) else []
+    if not any(isinstance(p, dict) and p.get("id") == "file-parser" for p in plugins):
+        plugins.append({"id": "file-parser", "pdf": {"engine": "pdf-text"}})
+    parsed["plugins"] = plugins
+    return json.dumps(parsed).encode("utf-8")
 
 
 def _scrub_request_for_gemini(body: bytes) -> bytes:
-    """Strip Gemini-incompatible schema keys from request tools. Bytes-in/out, never raises."""
+    """Strip Gemini-incompatible schema keys from request tools AND
+    rewrite Anthropic document blocks to image-shape so 9router's
+    inline_data translator picks them up. Bytes-in/out, never raises."""
     if not body:
         return body
     try:
@@ -127,6 +290,11 @@ def _scrub_request_for_gemini(body: bytes) -> bytes:
                 _scrub_gemini_schema(t["input_schema"])
             if isinstance(t.get("parameters"), (dict, list)):
                 _scrub_gemini_schema(t["parameters"])
+    try:
+        if isinstance(parsed, dict):
+            _rewrite_document_to_image(parsed)
+    except Exception:
+        pass
     return json.dumps(parsed).encode("utf-8")
 
 
@@ -163,7 +331,14 @@ def _is_gemini_model(model: str) -> bool:
 
 
 def _pick_upstream(model: str) -> tuple[str, dict[str, str]]:
-    """Return (base_url_without_v1, auth_headers) for this model."""
+    """Return (base_url_without_v1, auth_headers) for this model.
+
+    Routing for Claude-family models:
+      1. openswarm-pro mode → cloud proxy with bearer
+      2. Direct Anthropic API key set → api.anthropic.com (preferred when
+         user has their own key, avoids the 8h OAuth expiry pain)
+      3. Fallback → 9router (cc/ OAuth subscription, may 401 if expired)
+    Everything non-Claude goes to 9router for translation."""
     from backend.apps.settings.settings import load_settings
     s = load_settings()
 
@@ -173,6 +348,12 @@ def _pick_upstream(model: str) -> tuple[str, dict[str, str]]:
             proxy = (getattr(s, "openswarm_proxy_url", "") or "https://api.openswarm.com").rstrip("/")
             if bearer and proxy:
                 return (proxy, {"Authorization": f"Bearer {bearer}"})
+        ak = getattr(s, "anthropic_api_key", "") or ""
+        if ak.strip():
+            return ("https://api.anthropic.com", {
+                "x-api-key": ak.strip(),
+                "anthropic-version": "2023-06-01",
+            })
 
     return ("http://127.0.0.1:20128", {"x-api-key": "9router"})
 
@@ -210,6 +391,8 @@ async def proxy(rest: str, request: Request):
         body = _scrub_request_for_gemini(body)
     if _is_openai_max_completion_tokens_model(model):
         body = _scrub_request_for_openai_gpt5(body)
+    if _is_openrouter_model(model):
+        body = _inject_openrouter_file_parser(body)
 
     base_url, auth_headers = _pick_upstream(model)
 

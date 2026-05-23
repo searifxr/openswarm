@@ -257,6 +257,57 @@ async def warm_session_cache(session_id: str):
     return {"ok": True}
 
 
+@agents.router.post("/sessions/{session_id}/compact")
+async def compact_session(session_id: str):
+    """Run the summarizer over older turns to free up context.
+
+    Wired to the 'Compact memory' button in the pre-send overflow banner
+    and the /compact slash command. Sets compacted_through_msg_id so the
+    next turn's history-builder uses the summary in place of the
+    original messages.
+    """
+    session = agent_manager.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    fired = agent_manager._maybe_compact(session, force=True)
+    if fired:
+        from backend.apps.agents.ws_manager import ws_manager
+        try:
+            await ws_manager.send_to_session(session_id, "agent:context_status", {
+                "session_id": session_id,
+                "reason": "compacted",
+                "compacted_through_msg_id": session.compacted_through_msg_id,
+            })
+        except Exception:
+            pass
+    return {"ok": True, "compacted": fired}
+
+
+@agents.router.post("/sessions/{session_id}/clear")
+async def clear_session(session_id: str):
+    """Drop all messages from the session, keep MCPs/model/tools.
+
+    Wired to the /clear slash command. Quickest path to recover from an
+    overflow short of starting a fresh chat."""
+    session = agent_manager.sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="session not found")
+    session.messages = []
+    session.compacted_through_msg_id = None
+    session.tokens = {"input": 0, "output": 0}
+    session.needs_fresh_session = True
+    from backend.apps.agents.ws_manager import ws_manager
+    try:
+        await ws_manager.send_to_session(session_id, "agent:status", {
+            "session_id": session_id,
+            "status": session.status,
+            "session": session.model_dump(mode="json"),
+        })
+    except Exception:
+        pass
+    return {"ok": True}
+
+
 @agents.router.get("/subscriptions/status")
 async def subscriptions_status():
     """Check if 9Router is running and list connected providers."""

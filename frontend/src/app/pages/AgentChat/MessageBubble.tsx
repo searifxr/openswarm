@@ -20,7 +20,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { AgentMessage } from '@/shared/state/agentsSlice';
 import { openSettingsModal } from '@/shared/state/settingsSlice';
-import { useAppDispatch } from '@/shared/hooks';
+import { useAppDispatch, useAppSelector } from '@/shared/hooks';
 import { useClaudeTokens } from '@/shared/styles/ThemeContext';
 import { SKILL_COLOR } from '@/app/components/richEditorUtils';
 import PlanPicker from '@/app/components/PlanPicker';
@@ -70,8 +70,23 @@ interface OpenSwarmErrorInfo {
   ctaAction?: 'upgrade' | 'retry' | 'settings' | 'waitlist';
 }
 
+interface OverflowContext {
+  model?: string;
+  contextWindow?: number;
+  inputTokens?: number;
+  frameworkOverhead?: number;
+  activeMcpCount?: number;
+  messagesCount?: number;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
 /** Parses raw error text into a friendly card; returns null when the error isn't one we recognize. */
-function parseOpenSwarmError(text: string): OpenSwarmErrorInfo | null {
+function parseOpenSwarmError(text: string, ctx?: OverflowContext): OpenSwarmErrorInfo | null {
   if (!text) return null;
   if (/rate_limit_error|reached your OpenSwarm.*plan limit|Usage cap exceeded/i.test(text)) {
     const reset = text.match(/Resets in ([\dhms\s]+)/)?.[1];
@@ -93,15 +108,48 @@ function parseOpenSwarmError(text: string): OpenSwarmErrorInfo | null {
     };
   }
   if (/Prompt is too long|prompt_too_long|input length and `max_tokens`|context length/i.test(text)) {
+    const modelLower = (ctx?.model || '').toLowerCase();
+    const isHaiku = modelLower.includes('haiku');
+    const win = ctx?.contextWindow || 0;
+    const input = ctx?.inputTokens || 0;
+    const fw = ctx?.frameworkOverhead || 0;
+    const mcps = ctx?.activeMcpCount || 0;
+    if (isHaiku && mcps >= 5) {
+      return {
+        kind: 'too_many_tools',
+        title: 'Too many connected apps for Haiku',
+        detail:
+          `Haiku has the smallest memory of the Claude models${win ? ` (${formatTokens(win)} tokens)` : ''}. ` +
+          `Each of the ${mcps} active apps adds instructions Claude has to read before it can answer. ` +
+          'Turn off a few apps (Microsoft 365 is the heaviest), or switch to Sonnet or Opus, both have 5x more room.',
+        ctaLabel: 'Open Settings',
+        ctaAction: 'settings',
+      };
+    }
+    let lead: string;
+    if (win && input) {
+      // input is the API-reported total which includes our preset, tool
+      // defs, MCP descriptions etc. Subtract those for the user-facing
+      // "your content" number so we don't blame the user for our overhead.
+      const userContent = Math.max(0, input - fw);
+      lead = `The request totalled ~${formatTokens(input)} of ${formatTokens(win)} tokens this model can hold (your messages + files: ~${formatTokens(userContent)}).`;
+    } else if (win) {
+      lead = `This model holds ${formatTokens(win)} tokens and the request exceeded that.`;
+    } else {
+      lead = 'The request exceeded this model\'s context window.';
+    }
+    const extras: string[] = [];
+    if (fw) extras.push(`built-in tools + system prompt ~${formatTokens(fw)}`);
+    if (mcps > 0) extras.push(`${mcps} active app${mcps === 1 ? '' : 's'}`);
+    const breakdown = extras.length > 0 ? ` Overhead from OpenSwarm: ${extras.join(', ')}.` : '';
     return {
       kind: 'too_many_tools',
-      title: 'Too many connected apps for this model',
-      detail:
-        "Haiku is fast but has the smallest memory of the three Claude models. " +
-        "Each connected app adds instructions Claude has to read before it can answer, " +
-        "and you've added more than Haiku can hold in one go. Either turn off a few apps " +
-        "(Microsoft 365 is the heaviest by far), or switch to Sonnet or Opus; both have " +
-        "5x more room.",
+      title: 'This chat exceeded the model\'s context window',
+      detail: (
+        lead + breakdown +
+        ' Try detaching large files, running /compact to summarize older turns, ' +
+        'starting a fresh chat, or switching to a model with a larger window.'
+      ),
       ctaLabel: 'Open Settings',
       ctaAction: 'settings',
     };
@@ -248,7 +296,7 @@ function buildContextGroups(
       color: '#10b981',
       label,
       chips: allPaths.map((cp) => {
-        const name = cp.path.split('/').filter(Boolean).pop() || cp.path;
+        const name = cp.path.split(/[\\/]/).filter(Boolean).pop() || cp.path;
         return {
           label: name,
           tooltip: cp.path,
@@ -848,7 +896,21 @@ const MessageBubble: React.FC<Props> = React.memo(({ message, editing = false, o
     >{rawText}</ReactMarkdown>
   ), [rawText]);
 
-  const openswarmError = !isUser ? parseOpenSwarmError(rawText) : null;
+  const overflowCtx = useAppSelector((state) => {
+    const sid = state.agents.activeSessionId;
+    if (!sid) return undefined;
+    const s = state.agents.sessions[sid];
+    if (!s) return undefined;
+    return {
+      model: s.model,
+      contextWindow: s.context_window,
+      inputTokens: s.tokens?.input,
+      frameworkOverhead: s.framework_overhead_tokens,
+      activeMcpCount: s.active_mcps?.length ?? 0,
+      messagesCount: s.messages?.length ?? 0,
+    } as OverflowContext;
+  });
+  const openswarmError = !isUser ? parseOpenSwarmError(rawText, overflowCtx) : null;
 
   // (message.id, kind) keys so cap card analytics fire once, not on edits.
   React.useEffect(() => {

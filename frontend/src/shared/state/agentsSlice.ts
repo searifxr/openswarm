@@ -87,6 +87,8 @@ export interface AgentSession {
   ctx_used_pct?: number;
   cache_read_pct?: number;
   cache_read_tokens?: number;
+  context_window?: number;
+  framework_overhead_tokens?: number;
   context_overflow?: { reason: string; message: string; at: string } | null;
   mcp_suggestions?: Array<{ id: string; title: string; description: string; reason?: string }>;
   mcp_suggestions_is_vague?: boolean;
@@ -804,6 +806,8 @@ const agentsSlice = createSlice({
         cacheReadTokens: number;
         cacheReadPct: number;
         ctxUsedPct: number;
+        contextWindow?: number;
+        frameworkOverheadTokens?: number;
         activeMcps: string[];
       }>
     ) {
@@ -817,6 +821,12 @@ const agentsSlice = createSlice({
         session.cache_read_tokens = action.payload.cacheReadTokens;
         session.cache_read_pct = action.payload.cacheReadPct;
         session.ctx_used_pct = action.payload.ctxUsedPct;
+        if (typeof action.payload.contextWindow === 'number' && action.payload.contextWindow > 0) {
+          session.context_window = action.payload.contextWindow;
+        }
+        if (typeof action.payload.frameworkOverheadTokens === 'number') {
+          session.framework_overhead_tokens = action.payload.frameworkOverheadTokens;
+        }
         session.active_mcps = action.payload.activeMcps;
       }
     },

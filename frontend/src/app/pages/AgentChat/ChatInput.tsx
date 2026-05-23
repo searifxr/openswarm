@@ -160,6 +160,20 @@ function formatTokenCount(n: number): string {
   return String(n);
 }
 
+// Path basename that works on both POSIX (/Users/x/file.pdf) and Windows
+// (C:\Users\x\file.pdf). Splits on either separator; falls back to the
+// raw path so empty segments don't yield ''.
+function basename(p: string): string {
+  if (!p) return '';
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || p;
+}
+function pathTail(p: string, n: number): string {
+  if (!p) return '';
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.slice(-n).join('/');
+}
+
 const ContextRing: React.FC<{ used: number; limit: number; accentColor: string; trackColor: string }> = ({ used, limit, accentColor, trackColor }) => {
   if (used === 0) return null;
   const pct = Math.min((used / limit) * 100, 100);
@@ -337,6 +351,9 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   const modelsLoaded = useAppSelector((state) => state.models.loaded);
   const connectionMode = useAppSelector((state) => state.settings.data.connection_mode);
   const toolItems = useAppSelector((state) => state.tools.items);
+  const sessionFrameworkOverhead = useAppSelector((state) =>
+    sessionId ? (state.agents.sessions[sessionId]?.framework_overhead_tokens ?? 0) : 0,
+  );
 
 
   const allModelOptions = useMemo(() => {
@@ -644,6 +661,19 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
   const [contextPaths, setContextPaths] = useState<ContextPath[]>([]);
   const [forcedTools, setForcedTools] = useState<ForcedToolGroup[]>([]);
   const [copiedPathIdx, setCopiedPathIdx] = useState<number | null>(null);
+  const [oversizeQueue, setOversizeQueue] = useState<Array<{ path: string; name: string; tokens: number }>>([]);
+  const [summarizingPath, setSummarizingPath] = useState<string | null>(null);
+  const [summarizeError, setSummarizeError] = useState<string | null>(null);
+  const [sendBlock, setSendBlock] = useState<null | {
+    estimate: number;
+    window: number;
+    history: number;
+    system: number;
+    framework: number;
+    files: number;
+    prompt: number;
+    largestFile?: { path: string; tokens: number };
+  }>(null);
 
   useImperativeHandle(ref, () => ({
     getConfig: () => {
@@ -756,6 +786,43 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     });
   }, []);
 
+  const currentModelCtx = useMemo(() => {
+    const m = allModelOptions.flat.find((x: any) => x.value === model) as any;
+    return (m?.context_window as number) || 200_000;
+  }, [allModelOptions.flat, model]);
+
+  const currentModelApi = useMemo<string>(() => {
+    const m = allModelOptions.flat.find((x: any) => x.value === model) as any;
+    return ((m?.api as string) || 'anthropic').toLowerCase();
+  }, [allModelOptions.flat, model]);
+
+  // Mirrors backend agent_manager._resolve_attachments support matrix:
+  // PDFs route natively on Anthropic + Gemini (via anthropic-proxy
+  // document→image rewrite); refused on OpenAI/OpenRouter/custom until
+  // we land file-parser plugin / type:file translation.
+  // Mirrors backend agent_manager._resolve_attachments support matrix.
+  // PDFs: Anthropic, Gemini, OpenRouter (all empirically verified May
+  // 2026 via probe-pdf-roundtrip.py). OpenAI direct refused because
+  // OpenAI's image_url rejects non-image mime; user should switch to
+  // openrouter/openai/gpt-5 for OpenAI-via-OR with PDF support.
+  // Images: every provider via 9router image_url translation.
+  const pdfSupported = ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(currentModelApi);
+  const imageSupported = ['anthropic', 'gemini', 'gemini-cli', 'openai', 'openrouter'].includes(currentModelApi);
+
+  const pendingPayloadEstimate = useMemo(() => {
+    const history = Math.max(0, contextEstimate?.used ?? 0);
+    const filesSum = contextPaths.reduce((acc, cp) => acc + (cp.tokens || 0), 0);
+    return history + (sessionFrameworkOverhead || 0) + filesSum;
+  }, [contextEstimate, contextPaths, sessionFrameworkOverhead]);
+
+  const pendingKinds = useMemo(() => {
+    const set = new Set<string>();
+    for (const cp of contextPaths) {
+      if (cp.kind) set.add(cp.kind);
+    }
+    return set;
+  }, [contextPaths]);
+
   const uploadAndAttachFiles = useCallback(async (files: File[]) => {
     if (files.length === 0) return;
     setIsUploading(true);
@@ -768,24 +835,60 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
       });
       if (!resp.ok) throw new Error('Upload failed');
       const data = await resp.json();
-      const newPaths: ContextPath[] = (data.files || []).map((f: { path: string }) => ({
-        path: f.path,
-        type: 'file' as const,
-      }));
+      const halfCap = Math.floor(currentModelCtx * 0.5);
+      const oversize: Array<{ path: string; name: string; tokens: number }> = [];
+      const newPaths: ContextPath[] = (data.files || []).map((f: { path: string; name?: string; tokens?: number; kind?: 'text' | 'pdf' | 'image' | 'binary'; media_type?: string }) => {
+        const t = typeof f.tokens === 'number' ? f.tokens : 0;
+        if (t > halfCap) oversize.push({ path: f.path, name: f.name || basename(f.path) || 'file', tokens: t });
+        return { path: f.path, type: 'file' as const, tokens: t, kind: f.kind, media_type: f.media_type };
+      });
       setContextPaths((prev) => [...prev, ...newPaths]);
+      if (oversize.length > 0) setOversizeQueue((q) => [...q, ...oversize]);
     } catch (err) {
       console.error('File upload failed:', err);
     } finally {
       setIsUploading(false);
     }
-  }, []);
+  }, [currentModelCtx]);
 
   const handleSend = useCallback(async () => {
     const editor = editorRef.current;
     if (!editor || disabled) return;
+    if (summarizingPath) return;
+    if (oversizeQueue.length > 0) return;
     const serialized = serializeEditorContent(editor, attachedSkillsRef.current);
     let trimmed = serialized.trim();
     if (!trimmed) return;
+
+    // Pre-send dry-run guard. Sums every known component of next-turn input
+    // (history estimate from props, system prompt, framework/MCP overhead
+    // last reported by the API, attached file token estimates, and the
+    // prompt itself). If the sum exceeds 95% of the model's window, block
+    // the send and surface a banner with concrete recovery actions instead
+    // of round-tripping to a doomed API call. Conservative on purpose:
+    // tokenizers differ across providers (char/4 is rough), so we leave
+    // 5% headroom plus the API's own response budget.
+    {
+      const win = currentModelCtx;
+      const history = Math.max(0, contextEstimate?.used ?? 0);
+      const filesSum = contextPaths.reduce((acc, cp) => acc + (cp.tokens || 0), 0);
+      const promptTokens = Math.ceil(trimmed.length / 4);
+      const framework = sessionFrameworkOverhead || 0;
+      const systemTokens = 0;
+      const estimate = history + framework + filesSum + promptTokens + systemTokens;
+      if (win > 0 && estimate > Math.floor(win * 0.95)) {
+        let largest: { path: string; tokens: number } | undefined;
+        for (const cp of contextPaths) {
+          if ((cp.tokens || 0) > (largest?.tokens || 0)) largest = { path: cp.path, tokens: cp.tokens || 0 };
+        }
+        setSendBlock({
+          estimate, window: win,
+          history, system: systemTokens, framework, files: filesSum, prompt: promptTokens,
+          largestFile: largest,
+        });
+        return;
+      }
+    }
 
     onboardingBus.emit('chat:message_sent');
     if (window.location.hash.includes('/apps/')) {
@@ -1116,6 +1219,57 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
     if (otherFiles.length > 0) uploadAndAttachFiles(otherFiles);
   }, [addImageFiles, uploadAndAttachFiles]);
 
+  useEffect(() => {
+    const halfCap = Math.floor(currentModelCtx * 0.5);
+    const stillOversize: Array<{ path: string; name: string; tokens: number }> = [];
+    for (const cp of contextPaths) {
+      const t = cp.tokens || 0;
+      if (t > halfCap) {
+        const name = basename(cp.path) || cp.path;
+        stillOversize.push({ path: cp.path, name, tokens: t });
+      }
+    }
+    setOversizeQueue((q) => {
+      const next = stillOversize.filter((o) => !q.find((qq) => qq.path === o.path));
+      return [...q.filter((qq) => stillOversize.find((o) => o.path === qq.path)), ...next];
+    });
+  }, [currentModelCtx, contextPaths]);
+
+  const detachOversize = useCallback((path: string) => {
+    setContextPaths((prev) => prev.filter((cp) => cp.path !== path));
+    setOversizeQueue((q) => q.filter((o) => o.path !== path));
+  }, []);
+
+  const summarizeOversize = useCallback(async (path: string) => {
+    if (summarizingPath) return;  // another summarize is in flight; ignore
+    setSummarizingPath(path);
+    try {
+      const tok = (() => { try { return getAuthToken(); } catch { return ''; } })();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (tok) headers['Authorization'] = `Bearer ${tok}`;
+      const target = Math.min(8_000, Math.max(1_000, Math.floor(currentModelCtx * 0.05)));
+      const resp = await fetch(`${API_BASE}/settings/summarize-file`, {
+        method: 'POST', headers,
+        body: JSON.stringify({ path, target_tokens: target, primary_model: model }),
+      });
+      if (!resp.ok) {
+        let detail = `summarize failed (${resp.status})`;
+        try { const j = await resp.json(); if (j?.detail) detail = String(j.detail); } catch {}
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      const newPath: string = data.path;
+      const newTokens: number = data.tokens || 0;
+      setContextPaths((prev) => prev.map((cp) => cp.path === path ? { ...cp, path: newPath, tokens: newTokens, kind: 'text', media_type: 'text/plain' } : cp));
+      setOversizeQueue((q) => q.filter((o) => o.path !== path));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'summarize failed';
+      setSummarizeError(`${msg}. Detach the file or connect an aux provider in Settings.`);
+    } finally {
+      setSummarizingPath(null);
+    }
+  }, [currentModelCtx, model, summarizingPath]);
+
   const removeImage = useCallback((idx: number) => {
     setImages((prev) => {
       const removed = prev[idx];
@@ -1219,6 +1373,82 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
         visible={picker.visible}
       />
 
+      {sendBlock && (() => {
+        const fmt = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+        const over = sendBlock.estimate - sendBlock.window;
+        return (
+          <Box sx={{ mx: 1.5, mt: 1, mb: 0.5, p: 1.25, borderRadius: '10px', border: `1px solid ${c.status.error}`, bgcolor: `${c.status.error}10` }}>
+            <Typography sx={{ fontSize: '0.78rem', fontWeight: 600, color: c.status.error, mb: 0.5 }}>
+              This send would overflow the model's context window
+            </Typography>
+            <Typography sx={{ fontSize: '0.72rem', color: c.text.secondary, mb: 0.75, fontVariantNumeric: 'tabular-nums' }}>
+              ~{fmt(sendBlock.estimate)} of {fmt(sendBlock.window)} tokens ({over > 0 ? `${fmt(over)} over` : 'at cap'}). History {fmt(sendBlock.history)} · Files {fmt(sendBlock.files)} · Tools/MCPs {fmt(sendBlock.framework)} · This message {fmt(sendBlock.prompt)}.
+            </Typography>
+            <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+              {sessionId && (
+                <Box
+                  component="button"
+                  onClick={async () => {
+                    try {
+                      const tok = (() => { try { return getAuthToken(); } catch { return ''; } })();
+                      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                      if (tok) headers['Authorization'] = `Bearer ${tok}`;
+                      await fetch(`${API_BASE}/agents/sessions/${sessionId}/compact`, { method: 'POST', headers });
+                      setSendBlock(null);
+                    } catch (err) { console.error(err); }
+                  }}
+                  sx={{
+                    background: c.accent.primary, color: '#fff', border: 'none', borderRadius: '6px',
+                    px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer', '&:hover': { opacity: 0.9 },
+                  }}
+                >
+                  Compact memory
+                </Box>
+              )}
+              {sendBlock.largestFile && (
+                <Box
+                  component="button"
+                  onClick={() => {
+                    const p = sendBlock.largestFile!.path;
+                    setContextPaths((prev) => prev.filter((cp) => cp.path !== p));
+                    setSendBlock(null);
+                  }}
+                  sx={{
+                    background: 'transparent', color: c.text.primary, border: `1px solid ${c.border.subtle}`,
+                    borderRadius: '6px', px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer',
+                    '&:hover': { background: c.bg.secondary },
+                  }}
+                >
+                  Detach largest file (~{fmt(sendBlock.largestFile.tokens)})
+                </Box>
+              )}
+              <Box
+                component="button"
+                onClick={(e) => { setModelAnchor(e.currentTarget as HTMLElement); setSendBlock(null); }}
+                sx={{
+                  background: 'transparent', color: c.text.primary, border: `1px solid ${c.border.subtle}`,
+                  borderRadius: '6px', px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer',
+                  '&:hover': { background: c.bg.secondary },
+                }}
+              >
+                Switch model
+              </Box>
+              <Box
+                component="button"
+                onClick={() => setSendBlock(null)}
+                sx={{
+                  background: 'transparent', color: c.text.muted, border: 'none',
+                  borderRadius: '6px', px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer',
+                  '&:hover': { background: c.bg.secondary },
+                }}
+              >
+                Dismiss
+              </Box>
+            </Box>
+          </Box>
+        );
+      })()}
+
       {images.length > 0 && (
         <Box
           sx={{
@@ -1282,7 +1512,7 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
             const isAppWorkspace = /\/outputs_workspace\/ws-[^/]+\/?$/.test(cp.path);
             const label = isAppWorkspace
               ? 'App files'
-              : cp.path.split('/').filter(Boolean).slice(-2).join('/');
+              : pathTail(cp.path, 2);
             return (
               <Tooltip
                 key={`${cp.path}-${idx}`}
@@ -1300,13 +1530,24 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
                   },
                 }}
               >
+                {(() => {
+                  const unsupported = (cp.kind === 'pdf' && !pdfSupported) ||
+                                      (cp.kind === 'image' && !imageSupported) ||
+                                      cp.kind === 'binary';
+                  const chipColor = unsupported ? c.status.warning : c.accent.primary;
+                  return (
                 <Chip
                   icon={
                     cp.type === 'directory'
                       ? <FolderOpenIcon sx={{ fontSize: 14 }} />
                       : <InsertDriveFileOutlinedIcon sx={{ fontSize: 14 }} />
                   }
-                  label={label}
+                  label={(() => {
+                    const kindTag = cp.kind && cp.kind !== 'text' ? ` · ${cp.kind}` : '';
+                    const tokTag = typeof cp.tokens === 'number' && cp.tokens > 0 ? ` · ${formatTokenCount(cp.tokens)}` : '';
+                    const warn = unsupported ? ' · not on this model' : '';
+                    return `${label}${kindTag}${tokTag}${warn}`;
+                  })()}
                   size="small"
                   onClick={() => {
                     navigator.clipboard.writeText(cp.path);
@@ -1315,21 +1556,23 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
                   }}
                   onDelete={() => setContextPaths((prev) => prev.filter((_, i) => i !== idx))}
                   sx={{
-                    bgcolor: `${c.accent.primary}12`,
-                    color: c.accent.primary,
+                    bgcolor: `${chipColor}12`,
+                    color: chipColor,
                     fontSize: '0.72rem',
                     fontFamily: c.font.mono,
                     height: 26,
-                    maxWidth: 220,
+                    maxWidth: 280,
                     cursor: 'pointer',
                     '& .MuiChip-label': { overflow: 'hidden', textOverflow: 'ellipsis' },
                     '& .MuiChip-deleteIcon': {
-                      color: c.accent.primary,
+                      color: chipColor,
                       fontSize: 16,
                       '&:hover': { color: c.status.error },
                     },
                   }}
                 />
+                  );
+                })()}
               </Tooltip>
             );
           })}
@@ -2009,6 +2252,45 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
                             primary={highlightMatch(displayLabel)}
                             slotProps={{ primary: { sx: { fontSize: '0.8rem', color: model === opt.value ? c.text.primary : c.text.muted } } }}
                           />
+                          {(() => {
+                            const win = (opt.context_window as number) || 0;
+                            const api = (opt.api as string || 'anthropic').toLowerCase();
+                            const optSupportsPdf = ['anthropic', 'gemini', 'gemini-cli', 'openrouter'].includes(api);
+                            const optSupportsImage = ['anthropic', 'gemini', 'gemini-cli', 'openai', 'openrouter'].includes(api);
+                            const cannotPdf = pendingKinds.has('pdf') && !optSupportsPdf;
+                            const cannotImg = pendingKinds.has('image') && !optSupportsImage;
+                            if (!win) return null;
+                            const fits = pendingPayloadEstimate > 0 && win >= Math.floor(pendingPayloadEstimate * 1.1);
+                            const tight = pendingPayloadEstimate > 0 && !fits && win >= pendingPayloadEstimate;
+                            const tooSmall = pendingPayloadEstimate > 0 && win < pendingPayloadEstimate;
+                            return (
+                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, ml: 1 }}>
+                                {(cannotPdf || cannotImg) && (
+                                  <Box sx={{ fontSize: '0.62rem', color: '#ef4444', border: '1px solid #ef444440', borderRadius: '4px', px: 0.5, py: 0.05, lineHeight: 1.4 }}>
+                                    No {cannotPdf ? 'PDF' : 'image'}
+                                  </Box>
+                                )}
+                                {!cannotPdf && !cannotImg && fits && (
+                                  <Box sx={{ fontSize: '0.62rem', color: '#10b981', border: '1px solid #10b98140', borderRadius: '4px', px: 0.5, py: 0.05, lineHeight: 1.4 }}>
+                                    Fits
+                                  </Box>
+                                )}
+                                {!cannotPdf && !cannotImg && tight && (
+                                  <Box sx={{ fontSize: '0.62rem', color: '#f59e0b', border: '1px solid #f59e0b40', borderRadius: '4px', px: 0.5, py: 0.05, lineHeight: 1.4 }}>
+                                    Tight
+                                  </Box>
+                                )}
+                                {!cannotPdf && !cannotImg && tooSmall && (
+                                  <Box sx={{ fontSize: '0.62rem', color: '#ef4444', border: '1px solid #ef444440', borderRadius: '4px', px: 0.5, py: 0.05, lineHeight: 1.4 }}>
+                                    Too small
+                                  </Box>
+                                )}
+                                <Typography sx={{ fontSize: '0.66rem', color: c.text.ghost, fontVariantNumeric: 'tabular-nums' }}>
+                                  {formatTokenCount(win)}
+                                </Typography>
+                              </Box>
+                            );
+                          })()}
                         </MenuItem>
                       </Tooltip>
                     );
@@ -2358,6 +2640,65 @@ const ChatInput = forwardRef<ChatInputHandle, Props>(({ onSend, disabled, mode, 
           />
         </Box>
       </Modal>
+
+      <Snackbar
+        open={oversizeQueue.length > 0}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        sx={{ mb: 10 }}
+      >
+        <Alert
+          severity="warning"
+          variant="filled"
+          icon={false}
+          sx={{ alignItems: 'center', maxWidth: 520, fontSize: '0.78rem' }}
+          action={
+            <Box sx={{ display: 'flex', gap: 0.5 }}>
+              <Box
+                component="button"
+                disabled={summarizingPath === oversizeQueue[0]?.path}
+                onClick={() => oversizeQueue[0] && summarizeOversize(oversizeQueue[0].path)}
+                sx={{
+                  background: 'rgba(255,255,255,0.18)', color: 'inherit', border: 'none',
+                  borderRadius: '6px', px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer',
+                  '&:hover': { background: 'rgba(255,255,255,0.28)' },
+                  '&:disabled': { opacity: 0.6, cursor: 'wait' },
+                }}
+              >
+                {summarizingPath === oversizeQueue[0]?.path ? 'Summarizing…' : 'Summarize instead'}
+              </Box>
+              <Box
+                component="button"
+                onClick={() => oversizeQueue[0] && detachOversize(oversizeQueue[0].path)}
+                sx={{
+                  background: 'transparent', color: 'inherit', border: '1px solid rgba(255,255,255,0.4)',
+                  borderRadius: '6px', px: 1, py: 0.5, fontSize: '0.72rem', cursor: 'pointer',
+                  '&:hover': { background: 'rgba(255,255,255,0.12)' },
+                }}
+              >
+                Detach
+              </Box>
+            </Box>
+          }
+        >
+          {oversizeQueue[0] ? (
+            <span>
+              <strong>{oversizeQueue[0].name}</strong> is ~{formatTokenCount(oversizeQueue[0].tokens)} tokens, over 50% of this model's window ({formatTokenCount(currentModelCtx)}). Summarize sends the file content to your configured aux provider.
+            </span>
+          ) : null}
+        </Alert>
+      </Snackbar>
+
+      <Snackbar
+        open={!!summarizeError}
+        autoHideDuration={6000}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+        onClose={() => setSummarizeError(null)}
+        sx={{ mb: 18 }}
+      >
+        <Alert severity="error" variant="filled" onClose={() => setSummarizeError(null)} sx={{ fontSize: '0.78rem', maxWidth: 520 }}>
+          {summarizeError}
+        </Alert>
+      </Snackbar>
 
     </Box>
   );

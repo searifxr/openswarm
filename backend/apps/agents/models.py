@@ -126,11 +126,12 @@ class AgentSession(BaseModel):
     active_mcps: list[str] = Field(default_factory=list)
     # Heuristic preamble tokens (preset + tool defs + MCP descs + composed prompt); subtracted from displayed input.
     framework_overhead_tokens: int = 0
-    # Live ctx_used ratio triggering _maybe_compact at the next turn boundary; turn-based thresholds break under uneven workloads. 0.65 = 130K of 200K.
+    # Live ctx_used ratio triggering _maybe_compact at the next turn boundary; turn-based thresholds break under uneven workloads. Ratio of context_window, so 0.65 means 650K on a 1M-window model and 130K on a 200K-window model.
     compact_threshold_pct: float = 0.65
     compacted_through_msg_id: Optional[str] = None
-    # Hard pre-send guard at 0.90 (= 180K); past compaction we LRU-trim active_mcps, then surface the overflow card.
+    # Hard pre-send guard at 0.90; past compaction we LRU-trim active_mcps, then surface the overflow card.
     context_soft_cap_pct: float = 0.90
+    # Conservative default. Always overwritten at session creation, restore, and model-switch via _apply_context_window in agent_manager so the real model cap is used instead. Don't bump this without re-checking the trim/guard logic.
     context_window: int = 200_000
     # Provider-agnostic thinking level (off/low/medium/high/auto), translated per-API in agent_manager; only affects reasoning-flagged models.
     thinking_level: Literal["off", "low", "medium", "high", "auto"] = "auto"

@@ -27,6 +27,9 @@ const SETTINGS_API = `${API_BASE}/settings`;
 export interface ContextPath {
   path: string;
   type: 'file' | 'directory';
+  tokens?: number;
+  kind?: 'text' | 'pdf' | 'image' | 'binary';
+  media_type?: string;
 }
 
 interface DirectoryBrowserProps {

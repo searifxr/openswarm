@@ -578,6 +578,8 @@ class WebSocketManager {
             cacheReadTokens: data.cache_read_tokens ?? 0,
             cacheReadPct: data.cache_read_pct ?? 0,
             ctxUsedPct: data.ctx_used_pct ?? 0,
+            contextWindow: typeof data.context_window === 'number' ? data.context_window : undefined,
+            frameworkOverheadTokens: typeof data.framework_overhead_tokens === 'number' ? data.framework_overhead_tokens : undefined,
             activeMcps: Array.isArray(data.active_mcps) ? data.active_mcps : [],
           }));
         }

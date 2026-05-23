@@ -54,6 +54,33 @@ def _safe_resp_text(resp) -> str:
         return ""
 
 
+def _apply_context_window(session, settings=None) -> None:
+    """Set session.context_window from the registry for its (provider, model).
+
+    Called at every AgentSession creation, restore, and model-switch site so
+    the soft-cap trim, auto-compaction, and the UI percent meter line up
+    with the model's real cap (Opus/Sonnet 1M, Haiku 200k, custom values
+    declared per-provider). Silent fallback to the existing value keeps a
+    bad lookup from ever breaking a session.
+    """
+    try:
+        from backend.apps.agents.providers.registry import get_context_window
+        if settings is None:
+            try:
+                settings = load_settings()
+            except Exception:
+                settings = None
+        cw = get_context_window(
+            getattr(session, "provider", "") or "",
+            getattr(session, "model", "") or "",
+            settings,
+        )
+        if isinstance(cw, int) and cw > 0:
+            session.context_window = cw
+    except Exception:
+        logger.debug("context_window lookup failed; keeping existing value", exc_info=True)
+
+
 def _save_session(session_id: str, doc_data: dict):
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     with open(os.path.join(SESSIONS_DIR, f"{session_id}.json"), "w") as f:
@@ -788,6 +815,7 @@ class AgentManager:
             dashboard_id=config.dashboard_id,
             thinking_level=getattr(global_settings, "default_thinking_level", "auto"),
         )
+        _apply_context_window(session, global_settings)
         self.sessions[session_id] = session
 
         from backend.apps.service.service import APP_VERSION
@@ -799,35 +827,6 @@ class AgentManager:
         })
 
         return session
-
-    def _resolve_context_paths(self, context_paths: list | None) -> str:
-        """Read file contents / directory trees for attached context paths."""
-        if not context_paths:
-            return ""
-        sections = []
-        for cp in context_paths:
-            path = cp.get("path", "")
-            cp_type = cp.get("type", "file")
-            if not path or not os.path.exists(path):
-                sections.append(f"[Context: {path} — not found]")
-                continue
-            if cp_type == "file" and os.path.isfile(path):
-                try:
-                    with open(path, "r", errors="replace") as f:
-                        content = f.read(512_000)  # ~500KB cap per file
-                    sections.append(
-                        f"<context_file path=\"{path}\">\n{content}\n</context_file>"
-                    )
-                except Exception as e:
-                    sections.append(f"[Context: {path} — error reading: {e}]")
-            elif cp_type == "directory" and os.path.isdir(path):
-                tree_lines = self._build_dir_tree(path, max_depth=4)
-                sections.append(
-                    f"<context_directory path=\"{path}\">\n{chr(10).join(tree_lines)}\n</context_directory>"
-                )
-            else:
-                sections.append(f"[Context: {path} — type mismatch]")
-        return "\n\n".join(sections)
 
     def _build_dir_tree(self, root: str, max_depth: int = 4, prefix: str = "") -> list[str]:
         """Build a recursive directory tree listing."""
@@ -1098,19 +1097,41 @@ class AgentManager:
         )
         return replacement, blob_path
 
-    def _build_prompt_content(self, prompt: str, images: list | None = None, context_paths: list | None = None, forced_tools: list[str] | None = None, attached_skills: list | None = None):
-        """Build message content with optional image blocks, context, and forced tools for the Claude API."""
-        context_text = self._resolve_context_paths(context_paths)
+    def _build_prompt_content(self, prompt: str, images: list | None = None, context_paths: list | None = None, forced_tools: list[str] | None = None, attached_skills: list | None = None, api_type: str = "anthropic", model: str = ""):
+        """Build message content for the Anthropic SDK's prompt stream.
+
+        Routes attachments per provider:
+          - Anthropic: native `image` + `document` blocks for the active
+            Claude model. Text files inline as <context_file>. Binary that
+            isn't PDF/image gets a refusal placeholder.
+          - Gemini (api=gemini): we still talk to the SDK with Anthropic
+            content-block shapes; the 9router translation layer (cc/gc/gpt
+            lanes) converts to the provider's native shape. For Gemini's
+            native multimodal we emit image/document blocks the same way
+            and rely on 9router to rewrite to inline_data. Over 20MB
+            payloads get refused at this layer (Gemini's inline cap).
+          - OpenAI / Codex: image blocks pass through (image_url at the
+            wire); PDFs handled as documents on multimodal models; non-
+            multimodal models refuse.
+          - OpenRouter, custom OpenAI-compatible: text fallback for
+            anything binary, since native shape varies wildly. Caller can
+            opt-in to the OR file-parser via a separate plugins config.
+        """
+        context_text, native_blocks, refusals = self._resolve_attachments(
+            context_paths, api_type=api_type, model=model,
+        )
         forced_tools_text = self._resolve_forced_tools(forced_tools)
         skills_text = self._resolve_attached_skills(attached_skills)
 
-        parts = [p for p in (forced_tools_text, context_text, skills_text, prompt) if p]
+        refusal_text = "\n\n".join(refusals)
+        parts = [p for p in (forced_tools_text, context_text, refusal_text, skills_text, prompt) if p]
         full_prompt = "\n\n".join(parts)
 
-        if not images:
+        has_native = bool(native_blocks)
+        if not images and not has_native:
             return full_prompt
-        content = [{"type": "text", "text": full_prompt}]
-        for img in images:
+        content: list[dict] = [{"type": "text", "text": full_prompt}]
+        for img in (images or []):
             content.append({
                 "type": "image",
                 "source": {
@@ -1119,7 +1140,223 @@ class AgentManager:
                     "data": img["data"],
                 },
             })
+        content.extend(native_blocks)
         return content
+
+    def _resolve_attachments(self, context_paths: list | None, api_type: str, model: str) -> tuple[str, list[dict], list[str]]:
+        """Split context_paths into:
+           - inline text (returned as the existing <context_file> block string)
+           - native content blocks for this provider (PDFs/images)
+           - refusal strings that get appended to the prompt as plain text
+
+        Reuses the upload-time sniff (PDF magic / null-byte heuristic) so
+        a renamed `.pdf` actually classifies right, and a `.txt` with
+        binary garbage doesn't sneak through as text.
+
+        Two layers of size guard:
+          1) Per-file inline cap based on provider's raw size limit.
+          2) Total base64-expanded size cap across all native attachments,
+             because providers cap the WHOLE request body (Anthropic 32MB,
+             Gemini 20MB, OpenAI 50MB). 4 medium PDFs that pass the
+             per-file check can still collectively blow the request cap.
+        The last document block gets cache_control:ephemeral so a follow-up
+        turn on the same PDF reuses the cache prefix (Anthropic only).
+        """
+        if not context_paths:
+            return "", [], []
+        from backend.apps.settings.settings import _sniff_file_kind
+        import base64 as _b64
+        sections: list[str] = []
+        native: list[dict] = []
+        refusals: list[str] = []
+
+        # The Claude Agent SDK speaks only Anthropic content-block shape.
+        # 9router 0.3.60 translates `image` blocks to the per-provider
+        # native shape; we trust that (the existing `images` param has
+        # shipped on every provider since v1.0.29).
+        # `document` (PDF) blocks: native on Anthropic upstream. For
+        # Gemini, anthropic-proxy rewrites document→image (keeping
+        # media_type=application/pdf), and Gemini's inline_data accepts
+        # that mime type natively. For OpenRouter, anthropic-proxy
+        # detects document blocks + injects the file-parser plugin. For
+        # OpenAI we refuse PDFs (no 9router translator path for the
+        # type:file shape, and Codex OAuth can't hit /v1/files anyway).
+        api = (api_type or "anthropic").lower()
+        supports_image = api in ("anthropic", "gemini", "openai", "openrouter", "gemini-cli")
+        # PDFs flow per provider:
+        #   - Anthropic: native document blocks pass through cleanly.
+        #   - Gemini: anthropic_proxy rewrites document → image_url with
+        #     data:application/pdf base64; 9router translates to Gemini
+        #     inlineData natively. VERIFIED empirically May 2026 (47K
+        #     prompt tokens, real PaLM content summarized).
+        #   - OpenRouter: file-parser plugin injected in anthropic-proxy.
+        #   - OpenAI: REFUSED. OpenAI's image_url only accepts image/*
+        #     mime; the type:file shape gets stringified by 9router.
+        #     Workaround: route through `openrouter/openai/gpt-5` which
+        #     uses OR's file-parser plugin.
+        #   - Codex (cx/): models don't support PDFs.
+        supports_pdf = api in ("anthropic", "gemini", "gemini-cli", "openrouter")
+
+        # Per-file inline caps (raw bytes, before base64). Going over
+        # means the request would 4xx, blow our 64MB SDK buffer, or
+        # exceed the API's per-request cap on its own.
+        if api == "anthropic":
+            per_file_cap = 24 * 1024 * 1024
+            total_request_cap = 28 * 1024 * 1024  # under Anthropic's 32MB
+        elif api == "gemini":
+            per_file_cap = 14 * 1024 * 1024
+            total_request_cap = 15 * 1024 * 1024  # under Gemini's 20MB
+        elif api == "openai":
+            per_file_cap = 24 * 1024 * 1024
+            total_request_cap = 45 * 1024 * 1024  # under OpenAI's 50MB
+        elif api == "openrouter":
+            per_file_cap = 24 * 1024 * 1024
+            total_request_cap = 45 * 1024 * 1024
+        else:
+            per_file_cap = 0
+            total_request_cap = 0
+
+        # Running total of base64-expanded bytes already committed to the
+        # request. Anything that would push us over total_request_cap gets
+        # refused with concrete recovery actions.
+        b64_total = 0
+
+        for cp in context_paths:
+            path = cp.get("path", "") or ""
+            cp_type = cp.get("type", "file")
+            if not path or not os.path.exists(path):
+                sections.append(f"[Context: {path}, not found]")
+                continue
+            if cp_type == "directory" and os.path.isdir(path):
+                tree_lines = self._build_dir_tree(path, max_depth=4)
+                sections.append(
+                    f"<context_directory path=\"{path}\">\n{chr(10).join(tree_lines)}\n</context_directory>"
+                )
+                continue
+            if cp_type != "file" or not os.path.isfile(path):
+                sections.append(f"[Context: {path}, type mismatch]")
+                continue
+            try:
+                size = os.path.getsize(path)
+                with open(path, "rb") as fh:
+                    head = fh.read(4096)
+                kind, media_type = _sniff_file_kind(head, os.path.basename(path))
+
+                if kind == "text":
+                    with open(path, "r", errors="replace") as f:
+                        content = f.read(512_000)
+                    sections.append(
+                        f"<context_file path=\"{path}\">\n{content}\n</context_file>"
+                    )
+                    continue
+
+                # base64 expands ~4/3, ceil to be conservative.
+                b64_size = ((size + 2) // 3) * 4
+
+                if kind == "pdf":
+                    if not supports_pdf:
+                        if api == "openai":
+                            # Falls here only for Codex variants (gpt-5.3-codex etc.),
+                            # which don't accept PDFs even though their family does.
+                            refusals.append(
+                                f"[Attached PDF {os.path.basename(path)} ({size // 1024} KB) cannot be read on Codex models. "
+                                "Switch to a non-Codex GPT-5 (e.g. gpt-5.5), Claude, Gemini 3.x, or "
+                                "any model via OpenRouter to read PDFs natively.]"
+                            )
+                        else:
+                            refusals.append(
+                                f"[Attached PDF {os.path.basename(path)} ({size // 1024} KB) cannot be read on this provider. "
+                                "Switch to a Claude model (Sonnet 4.6, Opus 4.7, Haiku 4.5), Gemini 3.x, GPT-5 (non-Codex), "
+                                "or any model through OpenRouter to read PDFs natively.]"
+                            )
+                        continue
+                    if size > per_file_cap:
+                        refusals.append(
+                            f"[Attached PDF {os.path.basename(path)} ({size // (1024*1024)} MB) exceeds the per-file cap "
+                            f"of {per_file_cap // (1024*1024)} MB on this provider. Split the PDF or send a smaller excerpt.]"
+                        )
+                        continue
+                    if b64_total + b64_size > total_request_cap:
+                        room_mb = max(0, total_request_cap - b64_total) // (1024 * 1024)
+                        refusals.append(
+                            f"[Attached PDF {os.path.basename(path)} would push the request over "
+                            f"{total_request_cap // (1024*1024)} MB encoded (provider cap). "
+                            f"Only ~{room_mb} MB of room left this turn. Detach a file, or send PDFs in separate turns.]"
+                        )
+                        continue
+                    with open(path, "rb") as fh:
+                        data_b64 = _b64.b64encode(fh.read()).decode("ascii")
+                    block = {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": data_b64,
+                        },
+                    }
+                    native.append(block)
+                    b64_total += b64_size
+                    continue
+
+                if kind == "image":
+                    if not supports_image:
+                        refusals.append(
+                            f"[Attached image {os.path.basename(path)} cannot be displayed to this model. "
+                            "Switch to a vision-capable model (Claude, GPT-4o/5, Gemini).]"
+                        )
+                        continue
+                    if size > per_file_cap:
+                        refusals.append(
+                            f"[Attached image {os.path.basename(path)} ({size // (1024*1024)} MB) exceeds per-file cap.]"
+                        )
+                        continue
+                    if b64_total + b64_size > total_request_cap:
+                        room_mb = max(0, total_request_cap - b64_total) // (1024 * 1024)
+                        refusals.append(
+                            f"[Attached image {os.path.basename(path)} would push the request over "
+                            f"{total_request_cap // (1024*1024)} MB encoded. ~{room_mb} MB of room left.]"
+                        )
+                        continue
+                    with open(path, "rb") as fh:
+                        data_b64 = _b64.b64encode(fh.read()).decode("ascii")
+                    native.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type or "image/png",
+                            "data": data_b64,
+                        },
+                    })
+                    b64_total += b64_size
+                    continue
+
+                # binary, other
+                refusals.append(
+                    f"[Attached binary file {os.path.basename(path)} not inlined. Convert to text first.]"
+                )
+            except Exception as e:
+                sections.append(f"[Context: {path}, error reading: {e}]")
+
+        # Anthropic prompt caching: tag the last document block as ephemeral
+        # so a follow-up turn referencing the same PDF stays cache-warm.
+        # Per Anthropic docs, only the trailing cache_control marker matters
+        # for cache prefix scope; earlier markers are ignored.
+        if api == "anthropic" and native:
+            for blk in reversed(native):
+                if blk.get("type") == "document":
+                    blk["cache_control"] = {"type": "ephemeral"}
+                    break
+
+        context_text = "\n\n".join(sections)
+        return context_text, native, refusals
+
+    # Legacy entry point retained for any external caller; routes to the
+    # new attachment resolver with anthropic-default routing (no native
+    # blocks emitted, so behavior is the safe text-only old path).
+    def _resolve_context_paths(self, context_paths: list | None) -> str:
+        text, _native, refusals = self._resolve_attachments(context_paths, api_type="anthropic", model="")
+        refusal_text = "\n\n".join(refusals)
+        return "\n\n".join(p for p in (text, refusal_text) if p)
 
     async def _run_agent_loop(self, session_id: str, prompt: str, images: list | None = None, context_paths: list | None = None, forced_tools: list[str] | None = None, attached_skills: list | None = None, fork_session: bool = False, selected_browser_ids: list[str] | None = None):
         """Run the Claude Agent SDK query loop for a session."""
@@ -1127,7 +1364,12 @@ class AgentManager:
         if not session:
             return
         
-        prompt_content = self._build_prompt_content(prompt, images, context_paths, forced_tools, attached_skills)
+        from backend.apps.agents.providers.registry import get_api_type as _get_api_type
+        _api = _get_api_type(session.model)
+        prompt_content = self._build_prompt_content(
+            prompt, images, context_paths, forced_tools, attached_skills,
+            api_type=_api, model=session.model,
+        )
 
         try:
             from claude_agent_sdk import (
@@ -1715,6 +1957,7 @@ class AgentManager:
                     # than relying on the field's default_factory.
                     active_mcps=[],
                 )
+                _apply_context_window(sub_session)
                 self.sessions[sub_session_id] = sub_session
                 await ws_manager.broadcast_global("agent:status", {
                     "session_id": sub_session_id,
@@ -1814,10 +2057,13 @@ class AgentManager:
 
             # Per-turn estimate of framework overhead (subtracted from displayed
             # input). Conservative on purpose so honest over-shows beat lies.
-            # 16K Claude Code preset, 12K base+deferred tools, 600/MCP, char/4 prompt.
+            # 16K Claude Code preset, 12K base+deferred tools, ~3K/MCP (real
+            # MCP tool definitions range 1-10K depending on server; 3K is a
+            # rough median that keeps the meter honest without over-trimming),
+            # char/4 of composed prompt.
             _PRESET_OVERHEAD = 16_000
             _TOOL_DEFS_OVERHEAD = 12_000
-            _PER_MCP_OVERHEAD = 600
+            _PER_MCP_OVERHEAD = 3_000
             _composed_tokens = len(composed_prompt or "") // 4
             _mcp_tokens = len(session.active_mcps) * _PER_MCP_OVERHEAD
             session.framework_overhead_tokens = (
@@ -2149,7 +2395,13 @@ class AgentManager:
 
             options_kwargs = {
                 "model": resolved_model,
-                "max_buffer_size": 5 * 1024 * 1024,
+                # 64 MB ceiling on the SDK <-> CLI JSON-RPC channel. The
+                # default 5 MB blocked any base64'd PDF over ~3.5 MB; we
+                # now route PDFs/images as native content blocks, which
+                # base64-expand by ~33%. 64 MB clears the largest single
+                # Anthropic PDF (32 MB raw) with headroom for prompt +
+                # tool results sharing the same frame.
+                "max_buffer_size": 64 * 1024 * 1024,
                 "permission_mode": "default",
                 "can_use_tool": can_use_tool,
                 "stderr": _stderr_cb,
@@ -2551,6 +2803,29 @@ class AgentManager:
                             "trimmed": trimmed,
                             "estimate_after": _est_tokens,
                         })
+                        # Surface a visible system breadcrumb in the chat so
+                        # the user (and the model on the next turn) know
+                        # which MCPs got dropped. Without this, the model
+                        # may keep trying to call a now-missing tool and
+                        # the user has no idea why.
+                        try:
+                            _names = ", ".join(t.replace("mcp:", "") for t in trimmed)
+                            _trim_msg = Message(
+                                role="system",
+                                content=(
+                                    f"Trimmed {len(trimmed)} app{'s' if len(trimmed) != 1 else ''} from this session to fit "
+                                    f"the model's context: {_names}. Re-activate via MCPSearch + MCPActivate "
+                                    "if you still need them."
+                                ),
+                                branch_id=session.active_branch_id,
+                            )
+                            session.messages.append(_trim_msg)
+                            await ws_manager.send_to_session(session_id, "agent:message", {
+                                "session_id": session_id,
+                                "message": _trim_msg.model_dump(mode="json"),
+                            })
+                        except Exception:
+                            logger.exception("failed to emit MCP-trimmed breadcrumb")
                         # Trimming changes mcp_servers / outputs context →
                         # rebuild options. The cheapest correct path is
                         # to flag for fork on next turn via needs_fork
@@ -3403,6 +3678,32 @@ class AgentManager:
                                         (inp + cache_create + cache_read) * in_rate
                                         + out * out_rate
                                     ) / 1_000_000
+                            elif api_type in ("openai", "gemini") or (
+                                isinstance(resolved_model, str)
+                                and (resolved_model.startswith("cp-openai/")
+                                     or resolved_model.startswith("cp-gemini/")
+                                     or resolved_model.startswith("cp-google/"))
+                            ):
+                                # Direct OpenAI/Gemini API key lane. SDK's
+                                # total_cost_usd is computed at Anthropic
+                                # rates (Opus pricing) — for GPT-5.4-Mini
+                                # at $0.25/M input that's a 60x overcount
+                                # ($30 instead of $0.04 per Mehmet-style
+                                # 4-PDF turn). Use the published per-model
+                                # rates instead.
+                                from backend.apps.agents.providers.registry import get_direct_pricing
+                                pricing = get_direct_pricing(resolved_model) or get_direct_pricing(session.model)
+                                if pricing:
+                                    in_rate, out_rate = pricing
+                                    cost = (
+                                        (inp + cache_create + cache_read) * in_rate
+                                        + out * out_rate
+                                    ) / 1_000_000
+                                else:
+                                    # Unknown model in this family: zero out
+                                    # rather than ship an Anthropic-rate
+                                    # estimate that's wildly wrong.
+                                    cost = 0.0
 
                             session.cost_usd = cost
                             await ws_manager.send_to_session(session_id, "agent:cost_update", {
@@ -3412,13 +3713,15 @@ class AgentManager:
 
                         if isinstance(usage, dict):
                             # Per-turn context-usage broadcast. Drives the UI
-                            # status pill, the auto-compact threshold (Phase 2),
-                            # and is the user's only honest signal that they're
-                            # approaching the context cap. 200K is the standard-
-                            # tier ceiling Anthropic returns the
-                            # long-context-required 429 against; it's also the
-                            # right denominator for OAuth Pro/Max users.
-                            ctx_used_pct = round(total_input / 200_000.0, 4) if total_input else 0.0
+                            # status pill and the auto-compact threshold. The
+                            # denominator is the session's real model cap,
+                            # populated from registry.get_context_window at
+                            # session creation, restore, and model-switch
+                            # (see _apply_context_window). max(1, ...) is a
+                            # belt-and-braces guard against zero/None drift
+                            # from any future restore-from-disk corner case.
+                            _ctx_window = max(1, getattr(session, "context_window", 0) or 200_000)
+                            ctx_used_pct = round(total_input / _ctx_window, 4) if total_input else 0.0
                             cache_read_pct = round(cache_read / total_input, 4) if total_input else 0.0
                             try:
                                 await ws_manager.send_to_session(session_id, "agent:context_update", {
@@ -3428,6 +3731,8 @@ class AgentManager:
                                     "cache_read_tokens": cache_read,
                                     "cache_read_pct": cache_read_pct,
                                     "ctx_used_pct": ctx_used_pct,
+                                    "context_window": _ctx_window,
+                                    "framework_overhead_tokens": session.framework_overhead_tokens,
                                     "active_mcps": list(session.active_mcps),
                                 })
                             except Exception:
@@ -3533,26 +3838,70 @@ class AgentManager:
                 _stderr_tail = "\n".join(_stderr_buffer[-50:])
             except Exception:
                 _stderr_tail = ""
+            # If we already streamed a substantive assistant response this
+            # turn, the user got their answer; the error fired on a
+            # subsequent step (title gen, follow-up tool turn, etc.).
+            # Don't blast a "context exceeded" card over a completed reply.
+            _streamed_substantive = bool(stream_text_msg_id) and _current_turn_emitted
+            if _streamed_substantive and _is_long_context_error(e, extra_text=_stderr_tail):
+                # Mark the session completed (not error), keep the assistant
+                # reply visible, and skip the overflow card. The next user
+                # turn will properly hit the pre-send guard if the chat is
+                # still over cap.
+                session.status = "completed"
+                if stream_text_msg_id:
+                    try:
+                        await ws_manager.send_to_session(session_id, "agent:stream_end", {
+                            "session_id": session_id,
+                            "message_id": stream_text_msg_id,
+                        })
+                    except Exception:
+                        pass
+                return
             if _is_long_context_error(e, extra_text=_stderr_tail):
                 friendly_msg = (
                     "This conversation has grown too large for your account's "
                     "standard context window. Long-context requests require an "
-                    "upgraded tier — switch to Chat mode or start a fresh chat "
+                    "upgraded tier, switch to Chat mode or start a fresh chat "
                     "to continue."
                 )
                 error_msg = Message(role="system", content=friendly_msg, branch_id=session.active_branch_id)
                 session.messages.append(error_msg)
-                await ws_manager.send_to_session(session_id, "agent:context_overflow", {
+                _ovf_payload = {
                     "session_id": session_id,
                     "reason": "long_context_required",
                     "message": friendly_msg,
+                    "model": session.model,
+                    "provider": session.provider,
+                    "context_window": session.context_window,
+                    "framework_overhead_tokens": session.framework_overhead_tokens,
                     "input_tokens": session.tokens.get("input", 0),
                     "active_mcps": list(session.active_mcps),
-                })
+                    "compact_threshold_pct": session.compact_threshold_pct,
+                    "context_soft_cap_pct": session.context_soft_cap_pct,
+                }
+                await ws_manager.send_to_session(session_id, "agent:context_overflow", _ovf_payload)
                 await ws_manager.send_to_session(session_id, "agent:message", {
                     "session_id": session_id,
                     "message": error_msg.model_dump(mode="json"),
                 })
+                try:
+                    from backend.apps.service.client import submit_diagnostic
+                    submit_diagnostic({
+                        "kind": "context_overflow",
+                        "where": "agent_manager._run_streaming_turn",
+                        "session_id": session_id,
+                        "model": session.model,
+                        "provider": session.provider,
+                        "context_window": session.context_window,
+                        "input_tokens": session.tokens.get("input", 0),
+                        "framework_overhead_tokens": session.framework_overhead_tokens,
+                        "active_mcps_count": len(session.active_mcps),
+                        "messages_count": len(session.messages),
+                        "error_preview": (str(e) or "")[:500],
+                    })
+                except Exception:
+                    logger.debug("submit_diagnostic for context_overflow failed", exc_info=True)
             elif _is_auth_error(e, extra_text=_stderr_tail):
                 # Three sub-cases the user can hit, with distinct fixes:
                 #   1. "No credentials for provider: claude" — user picked a
@@ -3832,6 +4181,7 @@ class AgentManager:
             data = _load_session_data(session_id)
             if data:
                 session = AgentSession(**data)
+                _apply_context_window(session)
                 session.closed_at = None
                 self.sessions[session_id] = session
             else:
@@ -3857,6 +4207,7 @@ class AgentManager:
                 logger.info(f"[MCP-DEBUG] Forking session: api_type changed {session.model}→{model}")
 
             session.model = model
+            _apply_context_window(session)
             session_changed = True
         if mode and mode != session.mode:
             session.mode = mode
@@ -4493,6 +4844,7 @@ class AgentManager:
             raise ValueError(f"Session {session_id} not found in history")
 
         session = AgentSession(**data)
+        _apply_context_window(session)
 
         hours_since_closed = 0
         if data.get("closed_at"):
@@ -4616,6 +4968,7 @@ class AgentManager:
             if session.status in ("running", "waiting_approval"):
                 session.status = "stopped"
             session.pending_approvals = []
+            _apply_context_window(session)
             self.sessions[session.id] = session
             _delete_session_file(sid)
             logger.info(f"Restored session {session.id}")
@@ -4628,6 +4981,7 @@ class AgentManager:
             if data is None:
                 raise ValueError(f"Session {session_id} not found")
             source = AgentSession(**data)
+            _apply_context_window(source)
 
         source_messages = list(source.messages)
         if up_to_message_id:
@@ -4684,6 +5038,7 @@ class AgentManager:
             sdk_session_id=source.sdk_session_id,
             needs_fork=True,
         )
+        _apply_context_window(new_session)
 
         self.sessions[new_session.id] = new_session
 
@@ -4709,6 +5064,7 @@ class AgentManager:
             if data is None:
                 raise ValueError(f"Session {source_session_id} not found")
             source = AgentSession(**data)
+            _apply_context_window(source)
 
         source_name = source.name
 
@@ -4724,7 +5080,14 @@ class AgentManager:
                 timestamp=msg.timestamp,
                 branch_id=msg.branch_id,
                 parent_id=old_to_new_msg.get(msg.parent_id) if msg.parent_id else None,
-                context_paths=msg.context_paths,
+                # Sub-agents do NOT inherit parent's attached files. Each
+                # parent-message base64-expansion would re-fire in the
+                # sub-agent (cost explosion: a 25 MB PDF in parent +
+                # 5 InvokeAgent calls = 125 MB transmitted). The
+                # sub-agent receives the user's new message only; if it
+                # needs the file content, the parent message text from
+                # the prior turn already carries the model's summary.
+                context_paths=None,
                 attached_skills=msg.attached_skills,
                 forced_tools=msg.forced_tools,
                 images=msg.images,
@@ -4761,6 +5124,7 @@ class AgentManager:
             dashboard_id=dashboard_id or source.dashboard_id,
             parent_session_id=parent_session_id,
         )
+        _apply_context_window(fork)
 
         self.sessions[fork.id] = fork
 

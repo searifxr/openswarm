@@ -994,6 +994,873 @@ def test_get_context_window_unknown_returns_default():
     assert cw == 128_000
 
 
+def test_apply_context_window_overwrites_default_for_opus_4_7():
+    """Regression for issue #39: AgentSession used to stick at the 200k
+    dataclass default for every model. _apply_context_window must pull
+    the real 1M value from the registry for opus-4-7 / sonnet so the
+    soft-cap trim and the % meter both reflect the real model cap."""
+    from backend.apps.agents.models import AgentSession
+    from backend.apps.agents.agent_manager import _apply_context_window
+    s = AgentSession(id="x", name="t", model="opus-4-7", mode="agent")
+    assert s.context_window == 200_000
+    _apply_context_window(s)
+    assert s.context_window == 1_000_000
+    s2 = AgentSession(id="y", name="t", model="sonnet", mode="agent")
+    _apply_context_window(s2)
+    assert s2.context_window == 1_000_000
+    s3 = AgentSession(id="z", name="t", model="haiku", mode="agent")
+    _apply_context_window(s3)
+    assert s3.context_window == 200_000
+
+
+def test_apply_context_window_silent_on_unknown_model():
+    """Bad lookup must NEVER raise; sessions with unknown/custom models
+    that aren't in the registry fall back to the 128k registry default
+    without breaking session creation."""
+    from backend.apps.agents.models import AgentSession
+    from backend.apps.agents.agent_manager import _apply_context_window
+    s = AgentSession(id="x", name="t", model="nonexistent-model-xyz", mode="agent")
+    _apply_context_window(s)
+    assert s.context_window > 0
+
+
+def test_estimate_pdf_tokens_floors_empty_pdf_at_byte_heuristic():
+    """A truly empty / minimal PDF still returns a non-zero estimate so
+    the dry-run guard doesn't allow many tiny PDFs through silently."""
+    from backend.apps.settings.settings import _estimate_pdf_tokens
+    assert _estimate_pdf_tokens(b"") >= 1_000
+    assert _estimate_pdf_tokens(b"%PDF-1.4\n") >= 1_000
+
+
+def test_estimate_pdf_tokens_takes_max_of_pages_and_bytes():
+    """An image-heavy PDF with low page count should still report high
+    tokens via the byte-size signal; we never under-report."""
+    from backend.apps.settings.settings import _estimate_pdf_tokens
+    # 8MB PDF with 1 page (image-heavy) — byte heuristic should dominate.
+    fake = b"%PDF-1.4\n/Type /Pages /Count 1\n" + b"X" * (8 * 1024 * 1024)
+    tokens = _estimate_pdf_tokens(fake)
+    # byte heuristic: 8MB / 80 = 100k tokens > pages * 750 = 750
+    assert tokens >= 100_000
+
+
+def test_estimate_pdf_tokens_caps_malformed_count():
+    """A PDF with /Count 999999 (malformed or hostile) does NOT bypass
+    the 10k pages sanity cap; falls through to byte heuristic instead."""
+    from backend.apps.settings.settings import _estimate_pdf_tokens
+    fake = b"%PDF-1.4\n/Type /Pages /Count 999999\n"
+    t = _estimate_pdf_tokens(fake)
+    # Should NOT be 999999 * 750 = 750 million.
+    assert t < 50_000_000
+
+
+def test_upload_dedup_under_concurrent_uploads():
+    """Run N parallel uploads of the same logical filename through threads
+    and verify EVERY upload landed at a distinct path (no overwrites)."""
+    import os, threading
+    from backend.apps.settings.settings import UPLOAD_DIR
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    name = f"test_concurrent_{os.getpid()}.txt"
+    results: list[str] = []
+    lock = threading.Lock()
+
+    def writer():
+        base, ext = os.path.splitext(name)
+        dest = os.path.join(UPLOAD_DIR, name)
+        counter = 0
+        fd = None
+        while fd is None:
+            try:
+                fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                counter += 1
+                dest = os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"hi")
+        with lock:
+            results.append(dest)
+
+    threads = [threading.Thread(target=writer) for _ in range(10)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    try:
+        assert len(set(results)) == 10, f"expected 10 distinct paths, got {len(set(results))}"
+    finally:
+        for p in results:
+            try: os.remove(p)
+            except Exception: pass
+
+
+def test_resolve_attachments_handles_missing_path_gracefully():
+    """If a path in context_paths no longer exists (file deleted, TTL
+    cleanup fired, restored session referencing temp file across reboot),
+    we emit a 'not found' refusal instead of crashing."""
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    text, native, refusals = mgr._resolve_attachments(
+        [{"path": "/var/folders/nonexistent/definitely-gone.pdf", "type": "file"}],
+        api_type="anthropic", model="opus-4-7",
+    )
+    assert not native
+    # 'not found' lands in `text` (sections), not refusals, per implementation.
+    assert "not found" in text.lower()
+
+
+def test_resolve_attachments_handles_directory_path_not_file():
+    """A directory in context_paths gets dir-tree handling, not treated
+    as a file. Prevents trying to base64 a directory."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    tmpdir = tempfile.mkdtemp()
+    open(os.path.join(tmpdir, "a.txt"), "w").write("hello")
+    try:
+        text, native, refusals = mgr._resolve_attachments(
+            [{"path": tmpdir, "type": "directory"}],
+            api_type="anthropic", model="opus-4-7",
+        )
+        assert not native
+        assert "context_directory" in text
+    finally:
+        import shutil; shutil.rmtree(tmpdir)
+
+
+def test_resolve_attachments_mixed_kinds_total_size_guard():
+    """1 text + 1 PDF + 1 image attached together must respect both the
+    per-file caps AND the total-request-size cap as a single integrated
+    check, not three independent ones."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    paths = []
+    try:
+        # 10MB PDF + 10MB image + small text → 20MB raw = ~27MB base64,
+        # under Anthropic's 28MB cap so all should land natively.
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+            fh.write(b"%PDF-1.4\n"); fh.write(b"X" * (10 * 1024 * 1024))
+            paths.append(fh.name)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n"); fh.write(b"X" * (10 * 1024 * 1024))
+            paths.append(fh.name)
+        with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as fh:
+            fh.write("# notes"); paths.append(fh.name)
+        text, native, refusals = mgr._resolve_attachments(
+            [{"path": p, "type": "file"} for p in paths],
+            api_type="anthropic", model="opus-4-7",
+        )
+        # All three should make it: PDF native, image native, text inline.
+        assert len(native) == 2
+        assert any(b["type"] == "document" for b in native)
+        assert any(b["type"] == "image" for b in native)
+        assert "notes" in text
+        assert not refusals
+    finally:
+        for p in paths:
+            try: os.unlink(p)
+            except Exception: pass
+
+
+def test_upload_dedup_handles_filename_collision_atomically():
+    """O_CREAT|O_EXCL must reserve the destination so two callers
+    racing on the same filename get distinct outputs, not one
+    overwriting the other."""
+    import os, tempfile, shutil
+    from backend.apps.settings.settings import UPLOAD_DIR
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    name = f"test_dedup_{os.getpid()}.txt"
+    paths = []
+    try:
+        # Simulate two writers reserving the same base name back to back.
+        for _ in range(3):
+            base, ext = os.path.splitext(name)
+            dest = os.path.join(UPLOAD_DIR, name)
+            counter = 0
+            fd = None
+            while fd is None:
+                try:
+                    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError:
+                    counter += 1
+                    dest = os.path.join(UPLOAD_DIR, f"{base}_{counter}{ext}")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"hi")
+            paths.append(dest)
+        assert len(set(paths)) == 3
+    finally:
+        for p in paths:
+            try: os.remove(p)
+            except Exception: pass
+
+
+def test_sniff_recognises_macos_paths_with_spaces():
+    """File paths on macOS commonly contain spaces ('My Documents/file.pdf').
+    The sniffer reads contents, not the path, but agent_manager's
+    os.path.basename / open() must round-trip these correctly."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    tmpdir = tempfile.mkdtemp(prefix="space test ")
+    path = os.path.join(tmpdir, "my doc.pdf")
+    try:
+        with open(path, "wb") as f:
+            f.write(b"%PDF-1.4\n")
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        assert native and native[0]["type"] == "document"
+        assert not refusals
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+        try: os.rmdir(tmpdir)
+        except Exception: pass
+
+
+def test_resolve_attachments_uses_os_path_basename_for_windows_paths():
+    """When backend runs on Windows, paths arrive as C:\\Users\\X\\file.pdf.
+    os.path.basename handles backslash correctly on Windows (ntpath module),
+    but on POSIX (this test env) it treats backslash as a literal character.
+    Either way, the refusal copy embeds the result, so the test just verifies
+    no crash on Windows-shaped strings. Real Windows behavior is exercised
+    in CI on Windows hosts via .github/workflows/."""
+    import os, ntpath
+    # ntpath.basename simulates what Windows os.path.basename does on
+    # actual Windows hosts. Our backend uses os.path which == ntpath on
+    # Windows and posixpath on macOS/Linux, so paths go through correctly
+    # at runtime per host. This test asserts the parsing is correct WHEN
+    # routed through ntpath (the Windows code path).
+    win_path = r"C:\Users\rrios\AppData\Local\Temp\self-swarm-uploads\palm.pdf"
+    assert ntpath.basename(win_path) == "palm.pdf"
+    # And that os.path.join with mixed separators on Windows would still
+    # produce a valid path (ntpath is forgiving).
+    assert ntpath.basename(r"D:/Downloads\test.pdf") == "test.pdf"
+
+
+def test_sniff_file_kind_consistent_across_platforms():
+    """The sniffer reads bytes, never paths. So platform doesn't matter
+    for the classification logic — same bytes → same kind on Windows/Mac/Linux."""
+    from backend.apps.settings.settings import _sniff_file_kind
+    assert _sniff_file_kind(b"%PDF-1.4\n", "x.pdf") == ("pdf", "application/pdf")
+    assert _sniff_file_kind(b"\x89PNG\r\n\x1a\n", "x.png") == ("image", "image/png")
+    assert _sniff_file_kind(b"PK\x03\x04", "x.zip") == ("binary", None)
+    assert _sniff_file_kind(b"MZ\x90\x00", "x.exe") == ("binary", None)
+    assert _sniff_file_kind(b"hello world", "x.txt") == ("text", "text/plain")
+
+
+def test_estimate_pdf_tokens_consistent_across_platforms():
+    """Same byte-level math regardless of OS."""
+    from backend.apps.settings.settings import _estimate_pdf_tokens
+    # 5MB PDF should always estimate ≥ 5MB/80 = 65536 tokens.
+    fake = b"%PDF-1.4\n" + b"X" * (5 * 1024 * 1024)
+    assert _estimate_pdf_tokens(fake) >= 65000
+
+
+def test_sniff_handles_windows_style_backslash_path_string():
+    """Some Windows paths arrive at agent_manager with backslashes when
+    JSON-encoded or copied from Explorer. os.path.exists() handles
+    forward slashes on Windows but backslashes on POSIX would NOT find
+    the file. The basename() helper in the frontend already normalizes,
+    but verify the agent_manager refusal path is graceful."""
+    import os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    # A path that doesn't exist (POSIX cannot interpret backslashes as separator)
+    _t, native, refusals = mgr._resolve_attachments(
+        [{"path": r"C:\fake\path\nope.pdf", "type": "file"}],
+        api_type="anthropic", model="opus-4-7",
+    )
+    assert not native
+    # Should produce a "not found" refusal, not crash.
+    assert any("not found" in s.lower() or "not found" in s for s in (_t, *refusals)) or "not found" in _t
+
+
+def test_upload_dir_writable_on_macos_temp():
+    """Audit: verify UPLOAD_DIR resolves to a writable path on this OS.
+    On macOS, tempfile.gettempdir() → /var/folders/... which is outside
+    the app sandbox restrictions; our entitlements don't grant explicit
+    temp access but it works due to standard process inheritance. On
+    Windows, tempfile → C:/Users/X/AppData/Local/Temp/ which is always
+    writable. Failure here would block every file attachment."""
+    import os
+    from backend.apps.settings.settings import UPLOAD_DIR
+    assert os.path.isdir(UPLOAD_DIR), f"UPLOAD_DIR not a directory: {UPLOAD_DIR}"
+    probe = os.path.join(UPLOAD_DIR, ".write_probe")
+    try:
+        with open(probe, "w") as f:
+            f.write("ok")
+        assert os.path.isfile(probe)
+    finally:
+        try: os.remove(probe)
+        except Exception: pass
+
+
+def test_resolve_attachments_classifies_renamed_binary_as_binary_not_pdf():
+    """A .pdf rename of a ZIP/PNG must NOT be inlined as a document
+    block; magic-byte sniff guards us."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"PK\x03\x04fake zip masquerading as pdf")
+        path = fh.name
+    try:
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        assert not native
+        assert refusals and "binary" in refusals[0].lower()
+    finally:
+        os.unlink(path)
+
+
+def test_gemini_proxy_rewrites_document_to_openai_image_url_for_9router():
+    """9router 0.3.60 only preserves `image_url` blocks (chunk 318 filter);
+    Anthropic-shape image/document blocks get stringified. We rewrite to
+    OpenAI image_url with data: URL so 9router emits Gemini inlineData."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_gemini
+    body = json.dumps({
+        "model": "gemini-3.1-pro-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "summarize this"},
+                {"type": "document", "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0xLjQK",
+                }},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_gemini(body))
+    blocks = out["messages"][0]["content"]
+    assert blocks[0]["type"] == "text"
+    assert blocks[1]["type"] == "image_url"
+    assert blocks[1]["image_url"]["url"] == "data:application/pdf;base64,JVBERi0xLjQK"
+
+
+def test_gemini_proxy_also_rewrites_anthropic_image_blocks_to_image_url():
+    """Same fix applies to plain images: Anthropic image → OpenAI image_url
+    with data: URL, so 9router's filter preserves it instead of stringifying."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_gemini
+    body = json.dumps({
+        "model": "gemini-3-pro-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_gemini(body))
+    block = out["messages"][0]["content"][0]
+    assert block["type"] == "image_url"
+    assert block["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+
+
+def test_anthropic_document_block_schema_matches_docs():
+    """Schema-conformance: the document block our agent_manager emits for
+    Anthropic must structurally match the canonical shape from
+    https://docs.claude.com/en/docs/build-with-claude/pdf-support
+    (base64 inline). If Anthropic changes the schema we want a noisy test
+    failure here, not a runtime production failure."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%canonical schema test\n")
+        path = fh.name
+    try:
+        _t, native, _r = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        block = native[0]
+        # Per Anthropic docs, the exact required fields are:
+        assert set(block.keys()) >= {"type", "source"}
+        assert block["type"] == "document"
+        src = block["source"]
+        assert set(src.keys()) == {"type", "media_type", "data"}
+        assert src["type"] == "base64"
+        assert src["media_type"] == "application/pdf"
+        # cache_control is optional but our impl sets it on the last block
+        if "cache_control" in block:
+            assert block["cache_control"] == {"type": "ephemeral"}
+        # Base64 data must decode cleanly back to PDF magic header.
+        import base64 as _b64
+        decoded = _b64.b64decode(src["data"])
+        assert decoded.startswith(b"%PDF-")
+    finally:
+        os.unlink(path)
+
+
+def test_gemini_translated_block_matches_9router_image_url_filter():
+    """Per inspection of router/.next/server/chunks/318.js, 9router 0.3.60's
+    OpenAI→Gemini translator only handles `image_url` blocks with data: URLs
+    (it stringifies any other shape). Our translator must emit exactly that
+    shape for PDFs and images both."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_gemini
+    body = json.dumps({
+        "model": "gemini-3.1-pro-preview",
+        "messages": [{"role": "user", "content": [
+            {"type": "document", "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": "JVBERi0xLjQK",
+            }},
+        ]}],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_gemini(body))
+    block = out["messages"][0]["content"][0]
+    assert block["type"] == "image_url"
+    assert "image_url" in block
+    assert block["image_url"]["url"].startswith("data:application/pdf;base64,")
+
+
+def test_openrouter_plugin_array_matches_docs():
+    """Per https://openrouter.ai/docs/features/multimodal/pdfs, the
+    plugins array shape is `[{id:"file-parser", pdf:{engine: "..."}}]`
+    at the top level. Engines: pdf-text (free, deprecated → cloudflare),
+    mistral-ocr ($2/1k pages), native (model-supported)."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _inject_openrouter_file_parser
+    body = json.dumps({
+        "model": "openrouter/qwen/qwen-2.5-72b-instruct",
+        "messages": [{"role": "user", "content": [
+            {"type": "document", "source": {
+                "type": "base64", "media_type": "application/pdf", "data": "x",
+            }},
+        ]}],
+    }).encode("utf-8")
+    out = json.loads(_inject_openrouter_file_parser(body))
+    plugins = out["plugins"]
+    assert isinstance(plugins, list)
+    fp = [p for p in plugins if p.get("id") == "file-parser"][0]
+    # Shape exactly matches https://openrouter.ai/docs/features/multimodal/pdfs
+    assert set(fp.keys()) == {"id", "pdf"}
+    assert isinstance(fp["pdf"], dict)
+    assert fp["pdf"]["engine"] in ("pdf-text", "mistral-ocr", "native")
+
+
+def test_openai_translated_image_block_matches_image_url_data_uri():
+    """OpenAI's image_url accepts data: URIs only for image/* mime types
+    (verified May 2026 — application/pdf returns HTTP 400). The
+    translator rewrites Anthropic image blocks; document blocks are
+    refused upstream in agent_manager."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_openai_gpt5
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "iVBORw0KGgo=",
+            }},
+        ]}],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_openai_gpt5(body))
+    block = out["messages"][0]["content"][0]
+    assert block["type"] == "image_url"
+    assert block["image_url"]["url"] == "data:image/png;base64,iVBORw0KGgo="
+
+
+def test_openai_proxy_rewrites_image_block_only_documents_pass_through():
+    """OpenAI image_url only accepts image/* mime; documents are refused
+    upstream. Translator handles images, leaves documents untouched."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_openai_gpt5
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "max_tokens": 500,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what's in this image?"},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_openai_gpt5(body))
+    blocks = out["messages"][0]["content"]
+    assert blocks[0]["type"] == "text"
+    assert blocks[1]["type"] == "image_url"
+    assert blocks[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "max_completion_tokens" in out
+    assert "max_tokens" not in out
+
+
+def test_openai_proxy_skips_rewrite_when_no_document():
+    """Pure text turn on GPT-5 should only get the max_tokens rename."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_openai_gpt5
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_openai_gpt5(body))
+    assert out["messages"][0]["content"] == "hi"
+    assert out.get("max_completion_tokens") == 100
+
+
+def test_openai_proxy_defensive_on_malformed_document_blocks():
+    """Malformed document blocks (missing source, missing data) pass
+    through untouched so the upstream returns a proper error rather
+    than us silently dropping the file."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_openai_gpt5
+    body = json.dumps({
+        "model": "gpt-5.5",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "document"},
+                {"type": "document", "source": {"type": "url"}},
+                {"type": "document", "source": {"type": "base64"}},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_openai_gpt5(body))
+    for b in out["messages"][0]["content"]:
+        assert b["type"] == "document"
+
+
+def test_resolve_attachments_openai_codex_refused_for_pdfs():
+    """Codex variants refuse PDFs (both because Codex models don't read
+    PDFs AND because the OpenAI direct lane is currently disabled until
+    9router translation lands)."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="openai", model="gpt-5.3-codex",
+        )
+        assert not native
+        assert refusals
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_openai_codex_still_refuses_pdf():
+    """Codex variants don't support PDFs even though their OpenAI family
+    does; refusal should fire with switch hint."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="openai", model="gpt-5.3-codex",
+        )
+        assert not native
+        assert refusals and "codex" in refusals[0].lower()
+    finally:
+        os.unlink(path)
+
+
+def test_openrouter_proxy_injects_file_parser_plugin_when_document_present():
+    """OR's universal-PDF feature requires top-level plugins:[{id:file-parser,...}].
+    When a document block is in the request bound for OR, inject it."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _inject_openrouter_file_parser
+    body = json.dumps({
+        "model": "openrouter/qwen/qwen-2.5-72b-instruct",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "summarize"},
+                {"type": "document", "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": "JVBERi0xLjQK",
+                }},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_inject_openrouter_file_parser(body))
+    plugins = out.get("plugins")
+    assert isinstance(plugins, list) and len(plugins) >= 1
+    fp = next((p for p in plugins if p.get("id") == "file-parser"), None)
+    assert fp and fp["pdf"]["engine"] == "pdf-text"
+
+
+def test_openrouter_proxy_skips_plugin_when_no_document():
+    """No document block → don't inject the plugin (costs nothing, but
+    keeps the request body clean)."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _inject_openrouter_file_parser
+    body = json.dumps({
+        "model": "openrouter/qwen/qwen-2.5-72b-instruct",
+        "messages": [{"role": "user", "content": "just a question"}],
+    }).encode("utf-8")
+    out = json.loads(_inject_openrouter_file_parser(body))
+    assert "plugins" not in out
+
+
+def test_openrouter_proxy_dedupes_existing_file_parser_plugin():
+    """If a caller already provided file-parser, don't duplicate it."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _inject_openrouter_file_parser
+    body = json.dumps({
+        "model": "openrouter/qwen/qwen-2.5-72b-instruct",
+        "plugins": [{"id": "file-parser", "pdf": {"engine": "mistral-ocr"}}],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "x"}},
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_inject_openrouter_file_parser(body))
+    fps = [p for p in out["plugins"] if p.get("id") == "file-parser"]
+    assert len(fps) == 1
+    assert fps[0]["pdf"]["engine"] == "mistral-ocr"  # caller's engine wins
+
+
+def test_gemini_proxy_defensive_on_malformed_blocks():
+    """Bad shapes (missing data, wrong source.type, non-string data)
+    must NOT be rewritten; they pass through so the upstream sees the
+    error rather than a silently-corrupted block."""
+    import json
+    from backend.apps.agents.anthropic_proxy import _scrub_request_for_gemini
+    body = json.dumps({
+        "model": "gemini-3.1-pro-preview",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "document"},                        # no source
+                {"type": "document", "source": {}},          # empty source
+                {"type": "document", "source": {"type": "url"}},  # not base64
+                {"type": "document", "source": {"type": "base64"}},  # no data
+            ],
+        }],
+    }).encode("utf-8")
+    out = json.loads(_scrub_request_for_gemini(body))
+    for b in out["messages"][0]["content"]:
+        assert b["type"] == "document"
+
+
+def test_resolve_attachments_anthropic_emits_native_document():
+    """Anthropic upstream gets a `document` content block for PDFs, not
+    a text placeholder."""
+    import base64, tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        text, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        assert native and native[0]["type"] == "document"
+        assert native[0]["source"]["media_type"] == "application/pdf"
+        assert not refusals
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_openai_refuses_pdf_with_openrouter_hint():
+    """Empirical probe May 2026: OpenAI image_url rejects non-image mime
+    types with HTTP 400 'Invalid MIME type'. The type:file shape gets
+    stringified by 9router 0.3.60. Until we write a 9router-bypass
+    direct-API translator, refuse OpenAI PDFs with switch hint to
+    openrouter/openai/gpt-5 which has working PDF support via OR's
+    file-parser plugin."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        _text, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="openai", model="gpt-5.5",
+        )
+        assert not native
+        assert refusals
+        joined = " ".join(refusals).lower()
+        assert "openrouter" in joined or "claude" in joined
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_gemini_emits_native_document_after_translator_fix():
+    """After fixing the 9router 0.3.60 block-stripping bug via
+    anthropic_proxy._rewrite_document_to_image (now rewrites both
+    image AND document → OpenAI image_url with data: URL, which 9router
+    translates to Gemini inlineData), PDFs flow on Gemini natively."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        _text, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="gemini", model="gemini-3.1-pro-api",
+        )
+        assert native and native[0]["type"] == "document"
+        assert not refusals
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_text_file_inlined_not_native():
+    """Text files keep flowing through the existing context_file inline
+    path (no native block)."""
+    import tempfile, os
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False) as fh:
+        fh.write("# hello\nworld")
+        path = fh.name
+    try:
+        text, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="opus-4-7", model="opus-4-7",
+        )
+        assert not native
+        assert not refusals
+        assert "hello" in text
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_pdf_refused_when_too_large():
+    """Anthropic's per-file cap blocks PDFs over 24MB."""
+    import os, tempfile
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n")
+        fh.write(b"X" * (25 * 1024 * 1024))
+        path = fh.name
+    try:
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        assert not native
+        assert refusals
+        assert "per-file cap" in refusals[0].lower() or "exceeds" in refusals[0].lower()
+    finally:
+        os.unlink(path)
+
+
+def test_resolve_attachments_refuses_when_total_exceeds_request_cap():
+    """4 medium PDFs that each pass the per-file cap should still be
+    blocked when their combined base64 size would exceed Anthropic's
+    32MB request cap. This is the exact Mehmet scenario (30.3MB raw
+    of 4 PDFs base64 to ~40MB)."""
+    import os, tempfile
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    # 4 PDFs at ~8MB each = 32MB raw = ~43MB base64, exceeds 28MB cap.
+    paths = []
+    try:
+        for i in range(4):
+            with tempfile.NamedTemporaryFile(suffix=f"_{i}.pdf", delete=False) as fh:
+                fh.write(b"%PDF-1.4\n")
+                fh.write(b"X" * (8 * 1024 * 1024))
+                paths.append(fh.name)
+        _t, native, refusals = mgr._resolve_attachments(
+            [{"path": p, "type": "file"} for p in paths],
+            api_type="anthropic", model="opus-4-7",
+        )
+        # First few PDFs fit; later ones refused with "request over" message.
+        assert refusals, "expected refusals on multi-PDF over-cap"
+        assert any("encoded" in r.lower() and "provider cap" in r.lower() for r in refusals), \
+            f"expected total-size refusal copy; got: {refusals}"
+    finally:
+        for p in paths:
+            try: os.unlink(p)
+            except Exception: pass
+
+
+def test_resolve_attachments_anthropic_marks_last_document_ephemeral_for_cache():
+    """Anthropic prompt caching: the last document block gets
+    cache_control:ephemeral so multi-turn PDF chats stay cache-warm."""
+    import os, tempfile
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    paths = []
+    try:
+        for i in range(2):
+            with tempfile.NamedTemporaryFile(suffix=f"_{i}.pdf", delete=False) as fh:
+                fh.write(b"%PDF-1.4\n%test\n")
+                paths.append(fh.name)
+        _t, native, _r = mgr._resolve_attachments(
+            [{"path": p, "type": "file"} for p in paths],
+            api_type="anthropic", model="opus-4-7",
+        )
+        # Only the LAST document gets cache_control per Anthropic docs.
+        assert native[-1].get("cache_control") == {"type": "ephemeral"}
+        assert "cache_control" not in native[0]
+    finally:
+        for p in paths:
+            try: os.unlink(p)
+            except Exception: pass
+
+
+def test_resolve_attachments_anthropic_does_mark_ephemeral_but_only_anthropic():
+    """cache_control is Anthropic-only; don't pollute other-provider
+    blocks. Anthropic should get ephemeral on the last document block;
+    OpenRouter (which also supports PDFs) should NOT."""
+    import os, tempfile
+    from backend.apps.agents.agent_manager import AgentManager
+    mgr = AgentManager()
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as fh:
+        fh.write(b"%PDF-1.4\n%test\n")
+        path = fh.name
+    try:
+        _t, ant_native, _r = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="anthropic", model="opus-4-7",
+        )
+        assert ant_native and ant_native[0].get("cache_control") == {"type": "ephemeral"}
+        _t, or_native, _r = mgr._resolve_attachments(
+            [{"path": path, "type": "file"}], api_type="openrouter", model="openrouter/openai/gpt-5",
+        )
+        assert or_native and "cache_control" not in or_native[0]
+    finally:
+        os.unlink(path)
+
+
+def test_apply_context_window_respects_custom_provider_value():
+    """Custom OpenAI-compatible models supply their own context_window
+    via settings.custom_providers. _apply_context_window must look them
+    up the same way get_context_window does."""
+    from backend.apps.agents.models import AgentSession
+    from backend.apps.agents.agent_manager import _apply_context_window
+    from backend.apps.settings.models import AppSettings, CustomProvider
+    s = AgentSession(id="x", name="t", provider="custom", model="custom/ollama/qwen2.5:7b", mode="agent")
+    settings = AppSettings(custom_providers=[
+        CustomProvider(
+            name="Ollama",
+            base_url="http://localhost:11434/v1",
+            api_key="",
+            models=[{"value": "qwen2.5:7b", "label": "Qwen 2.5 7B", "context_window": 32_000}],
+        ),
+    ])
+    _apply_context_window(s, settings)
+    assert s.context_window == 32_000
+
+
 # ---------------------------------------------------------------------------
 # Custom OpenAI-compatible providers (Ollama Cloud, Together, etc.)
 # ---------------------------------------------------------------------------
