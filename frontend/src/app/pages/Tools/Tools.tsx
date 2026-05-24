@@ -462,7 +462,16 @@ const Tools: React.FC = () => {
   const { servers: regServersRaw, total: regTotal, loading: regLoading, stats: regStats, detail: regDetail, detailLoading: regDetailLoading } = useAppSelector((s) => s.mcpRegistry);
   const devMode = useAppSelector((s) => s.settings.data.dev_mode);
   const allTools = Object.values(items);
-  const tools = allTools;
+  // Deterministic order so cards don't jump around on refetch: connected + on first, then on,
+  // then anything toggled off (connection state ignored once it's off). A-Z within each tier.
+  const tools = useMemo(() => {
+    const tier = (t: ToolDefinition) =>
+      t.enabled === false ? 2 : (t.auth_status === 'connected' ? 0 : 1);
+    return Object.values(items).sort((a, b) => {
+      const d = tier(a) - tier(b);
+      return d !== 0 ? d : (a.name || '').localeCompare(b.name || '');
+    });
+  }, [items]);
   const uninstalledIntegrations = useMemo(() => INTEGRATIONS.filter((ig) => !allTools.find((t) => t.name === ig.name)), [allTools]);
   const getIntegrationForTool = useCallback((tool: ToolDefinition) => INTEGRATIONS.find((ig) => ig.name === tool.name), []);
 
@@ -1493,7 +1502,7 @@ const Tools: React.FC = () => {
                 return (
                   <Card
                     key={tool.id}
-                    sx={{ order: tool.auth_status === 'connected' ? 0 : 1, bgcolor: c.bg.surface, border: `1px solid ${isExpanded ? c.accent.primary : c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, '&:hover': { borderColor: isDisabled ? c.border.subtle : c.accent.primary, boxShadow: isDisabled ? undefined : '0 0 0 1px rgba(174,86,48,0.12)' }, transition: 'border-color 0.2s, box-shadow 0.2s' }}
+                    sx={{ bgcolor: c.bg.surface, border: `1px solid ${isExpanded ? c.accent.primary : c.border.subtle}`, borderRadius: 2, boxShadow: c.shadow.sm, '&:hover': { borderColor: isDisabled ? c.border.subtle : c.accent.primary, boxShadow: isDisabled ? undefined : '0 0 0 1px rgba(174,86,48,0.12)' }, transition: 'border-color 0.2s, box-shadow 0.2s' }}
                   >
                     <CardContent sx={{ py: 1.5, px: 2, '&:last-child': { pb: 1.5 } }}>
                       <Box
