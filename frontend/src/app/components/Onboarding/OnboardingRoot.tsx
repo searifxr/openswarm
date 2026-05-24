@@ -17,6 +17,7 @@ import AgenticCursor, { type AgenticCursorHandle } from './ac/AgenticCursor';
 import { onboardingDirector } from './OnboardingDirector';
 import { STEPS } from './steps';
 import OnboardingPanel from './OnboardingPanel';
+import OnboardingDockedTab from './OnboardingDockedTab';
 import { onboardingBus } from './eventBus';
 import { report } from './telemetry';
 
@@ -217,6 +218,7 @@ const OnboardingRoot: React.FC = () => {
     <>
       <AgenticCursor ref={acRef} />
       <OnboardingPanel />
+      <OnboardingDockedTab />
     </>
   );
 };
