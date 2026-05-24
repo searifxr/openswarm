@@ -1086,6 +1086,22 @@ const agentsSlice = createSlice({
           session.status = 'running';
         }
       })
+      // The optimistic .pending above set status='running'; on a failed send/edit nothing
+      // ever cleared it, so the input stayed locked forever. Release it. Guard on 'running'
+      // so a status the WS already advanced isn't clobbered, and use 'completed' (not a
+      // blocked terminal) so a later WS 'running' can still take if the agent did start.
+      .addCase(sendMessage.rejected, (state, action) => {
+        const session = state.sessions[action.meta.arg.sessionId];
+        if (session && session.status === 'running') {
+          session.status = 'completed';
+        }
+      })
+      .addCase(editMessage.rejected, (state, action) => {
+        const session = state.sessions[action.meta.arg.sessionId];
+        if (session && session.status === 'running') {
+          session.status = 'completed';
+        }
+      })
       .addCase(stopAgent.fulfilled, (state, action) => {
         const session = state.sessions[action.payload];
         if (session) {
