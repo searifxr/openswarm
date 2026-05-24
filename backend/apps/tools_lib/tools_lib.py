@@ -37,6 +37,7 @@ if os.environ.get("OPENSWARM_PACKAGED") == "1":
 async def tools_lib_lifespan():
     os.makedirs(DATA_DIR, exist_ok=True)
     _ensure_default_permissions()
+    _reclassify_existing_tools()
     yield
 
 
@@ -66,6 +67,39 @@ def _ensure_default_permissions() -> None:
     merged = {**desired, **existing}
     if merged != existing:
         save_builtin_permissions(merged)
+
+
+def _reclassify_existing_tools() -> None:
+    """One-time correction for tools discovered before service rules were integration-scoped: most
+    integrations got mislabeled under a bogus 'Google' group (generic keyword rules applied globally).
+    Recompute services/groups from each tool's stored tool names. Idempotent; rewrites only on change.
+    """
+    if not os.path.isdir(DATA_DIR):
+        return
+    for fname in os.listdir(DATA_DIR):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            tool = _load(fname[:-5])
+        except Exception:
+            continue
+        perms = tool.tool_permissions or {}
+        if not perms.get("_services"):
+            continue
+        names = [k for k in perms if not k.startswith("_")]
+        if not names:
+            continue
+        services, service_groups, all_read, all_write = _classify_services(names, tool.name)
+        if perms.get("_services") == services and perms.get("_service_groups") == service_groups:
+            continue
+        perms["_services"] = services
+        perms["_service_groups"] = service_groups
+        perms["_categories"] = {"read": all_read, "write": all_write}
+        tool.tool_permissions = perms
+        try:
+            _save(tool)
+        except Exception:
+            pass
 
 # All providers go through the Fly cloud-proxy claim handoff. The
 # v1.0.28 local Google callback was retired in v1.0.29 once the prod
@@ -593,14 +627,54 @@ def _categorize_tool(name: str) -> str:
     return "write"
 
 
-def _extract_service(name: str) -> tuple[str, str]:
-    """Extract the service and group from a tool name (e.g. 'search_gmail_messages' -> ('Gmail', 'Google'))."""
-    lower = name.lower()
-    for keywords, display, group in _SERVICE_RULES:
-        for kw in keywords:
-            if kw in lower:
-                return display, group
-    return "Other", ""
+def _integration_domain(integration: str) -> str:
+    """Which curated _SERVICE_RULES set applies to this integration, if any. The Google rules use
+    generic words (message/table/page/doc/script) that otherwise mis-tag Slack/Notion/Airtable/M365."""
+    n = (integration or "").lower()
+    if "google" in n:
+        return "Google"
+    if "youtube" in n:
+        return "YouTube"
+    if "reddit" in n:
+        return "Reddit"
+    return ""
+
+
+def _extract_service(name: str, integration: str) -> tuple[str, str]:
+    """Map a tool name to (service, group). Curated rulesets apply only to the integration they were
+    written for; every other integration groups under its own name so it isn't mislabeled as Google."""
+    domain = _integration_domain(integration)
+    if domain:
+        lower = name.lower()
+        for keywords, display, group in _SERVICE_RULES:
+            if group != domain:
+                continue
+            for kw in keywords:
+                if kw in lower:
+                    return display, group
+        return "Other", ""
+    # No curated rules: one service per integration, grouped under itself.
+    return (integration or "Other"), ""
+
+
+def _classify_services(
+    tool_names: list[str], integration: str
+) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[str]], list[str], list[str]]:
+    """Bucket tool names into services + service groups + read/write categories for one integration."""
+    services: dict[str, dict[str, list[str]]] = {}
+    service_groups: dict[str, list[str]] = {}
+    for name in tool_names:
+        cat = _categorize_tool(name)
+        svc, group = _extract_service(name, integration)
+        services.setdefault(svc, {"read": [], "write": []})
+        services[svc][cat].append(name)
+        if group:
+            service_groups.setdefault(group, [])
+            if svc not in service_groups[group]:
+                service_groups[group].append(svc)
+    all_read = [n for s in services.values() for n in s["read"]]
+    all_write = [n for s in services.values() for n in s["write"]]
+    return services, service_groups, all_read, all_write
 
 
 def _parse_sse_json(text: str) -> dict | None:
@@ -915,25 +989,9 @@ async def discover_tools(tool_id: str):
         logger.warning(f"MCP tool discovery failed for {tool.name}: {msg}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"Discovery failed: {msg}")
 
-    services: dict[str, dict[str, list[str]]] = {}
-    service_groups: dict[str, list[str]] = {}
-    permissions: dict[str, Any] = {}
-
-    for t in raw_tools:
-        name = t["name"]
-        cat = _categorize_tool(name)
-        svc, group = _extract_service(name)
-        if svc not in services:
-            services[svc] = {"read": [], "write": []}
-        services[svc][cat].append(name)
-        permissions[name] = tool.tool_permissions.get(name, "ask")
-        if group:
-            service_groups.setdefault(group, [])
-            if svc not in service_groups[group]:
-                service_groups[group].append(svc)
-
-    all_read = [n for s in services.values() for n in s["read"]]
-    all_write = [n for s in services.values() for n in s["write"]]
+    tool_names = [t["name"] for t in raw_tools]
+    services, service_groups, all_read, all_write = _classify_services(tool_names, tool.name)
+    permissions: dict[str, Any] = {n: tool.tool_permissions.get(n, "ask") for n in tool_names}
     permissions["_categories"] = {"read": all_read, "write": all_write}
     permissions["_services"] = services
     permissions["_service_groups"] = service_groups
