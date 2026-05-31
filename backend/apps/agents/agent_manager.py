@@ -129,6 +129,7 @@ class AgentManager:
     def __init__(self):
         self.sessions: dict[str, AgentSession] = {}
         self.tasks: dict[str, asyncio.Task] = {}
+        self._session_lock = asyncio.Lock() # Session lock
     
     def _resolve_mode(self, mode_id: str) -> tuple[list[str], str | None, str | None]:
         return _resolve_mode(mode_id, get_all_tool_names)
@@ -3750,10 +3751,12 @@ class AgentManager:
     async def close_session(self, session_id: str) -> None:
         """Close a session: pause the agent if running, persist to JSON file,
         and remove from in-memory state. Also stops browser-agent children."""
-        children = [
-            s for s in self.sessions.values()
-            if s.parent_session_id == session_id and s.mode == "browser-agent"
-        ]
+        async with self._session_lock: # ← Lock access to sessions
+            children = [
+                s for s in self.sessions.values()
+                if s.parent_session_id == session_id and s.mode == "browser-agent"
+            ]
+        
         for child in children:
             await self.stop_agent(child.id)
 
@@ -3799,17 +3802,22 @@ class AgentManager:
             "dashboard_id": session.dashboard_id,
         })
 
-        self.sessions.pop(session_id, None)
-        self.tasks.pop(session_id, None)
-        logger.info(f"Session {session_id} closed and persisted")
+        async with self._session_lock:
+            self.sessions.pop(session_id, None)
+            self.tasks.pop(session_id, None)
+            logger.info(f"Session {session_id} closed and persisted")
 
     async def delete_session(self, session_id: str) -> None:
         """Permanently delete a session: remove from memory and JSON file.
         Also stops browser-agent children first."""
-        children = [
-            s for s in self.sessions.values()
-            if s.parent_session_id == session_id and s.mode == "browser-agent"
-        ]
+       
+        async with self._session_lock: # ← FIX: Lock access to sessions
+            children = [
+                s for s in list(self.sessions.values()) 
+                if s.parent_session_id == session_id and s.mode == "browser-agent"
+            ]
+
+        # Stop children outside the lock to avoid deadlock
         for child in children:
             await self.stop_agent(child.id)
 
@@ -3820,9 +3828,10 @@ class AgentManager:
                 await task
             except asyncio.CancelledError:
                 pass
-
-        self.sessions.pop(session_id, None)
-        self.tasks.pop(session_id, None)
+        
+        async with self._session_lock: # ← Lock removal operations
+            self.sessions.pop(session_id, None)
+            self.tasks.pop(session_id, None)
 
         _delete_session_file(session_id)
         logger.info(f"Session {session_id} permanently deleted")
